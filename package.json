@@ -1,0 +1,48 @@
+{
+  "name": "@featureflip/js",
+  "version": "1.0.0",
+  "description": "JavaScript/TypeScript SDK for FeatureFlip",
+  "license": "Apache-2.0",
+  "homepage": "https://featureflip.io/docs",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/node.d.ts",
+      "node": {
+        "import": "./dist/node.mjs",
+        "require": "./dist/node.cjs"
+      },
+      "browser": {
+        "import": "./dist/browser.mjs",
+        "require": "./dist/browser.cjs"
+      },
+      "default": "./dist/browser.mjs"
+    }
+  },
+  "types": "./dist/node.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "eventsource": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.3",
+    "vite-plugin-dts": "^4.0.0",
+    "vitest": "^4.1.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
