@@ -1,21 +1,22 @@
-# @featureflip/sdk
+# @featureflip/js
 
 Server-side JavaScript/TypeScript SDK for [Featureflip](https://featureflip.io) - evaluate feature flags locally with near-zero latency.
 
 ## Installation
 
 ```bash
-npm install @featureflip/sdk
+npm install @featureflip/js
 ```
 
 ## Quick Start
 
 ```ts
-import { FeatureflipClient } from '@featureflip/sdk';
+import { FeatureflipClient, createNodePlatform } from '@featureflip/js';
 
-const client = new FeatureflipClient({
-  sdkKey: 'your-sdk-key',
-});
+const client = FeatureflipClient.get(
+  { sdkKey: 'your-sdk-key', baseUrl: 'https://eval.featureflip.io' },
+  createNodePlatform(),
+);
 
 await client.waitForInitialization();
 
@@ -28,22 +29,25 @@ if (enabled) {
 await client.close();
 ```
 
+> **Singleton by construction.** `FeatureflipClient.get()` is the only way to obtain a client. Calling `get()` more than once with the same SDK key returns handles pointing at one shared underlying client — the factory is refcounted, so closing a handle only shuts down the shared core when the last handle is closed. This makes the SDK safe to call from per-request handlers and DI containers without leaking SSE connections.
+
 ## Configuration
 
 ```ts
-const client = new FeatureflipClient({
-  sdkKey: 'your-sdk-key',
-  baseUrl: 'https://eval.featureflip.io', // Evaluation API URL (default)
-  streaming: true,           // Use SSE for real-time updates (default)
-  pollInterval: 30000,       // Polling interval in ms if streaming=false
-  flushInterval: 30000,      // Event flush interval in ms
-  flushBatchSize: 100,       // Events per batch
-  initTimeout: 10000,        // Max ms to wait for initialization
-  maxStreamRetries: 5,       // SSE retries before falling back to polling
-});
+const client = FeatureflipClient.get(
+  {
+    sdkKey: 'your-sdk-key',
+    baseUrl: 'https://eval.featureflip.io', // Evaluation API URL
+    streaming: true,           // Use SSE for real-time updates (default)
+    pollInterval: 30000,       // Polling interval in ms if streaming=false
+    flushInterval: 30000,      // Event flush interval in ms
+    flushBatchSize: 100,       // Events per batch
+    initTimeout: 10000,        // Max ms to wait for initialization
+    maxStreamRetries: 5,       // SSE retries before falling back to polling
+  },
+  createNodePlatform(),
+);
 ```
-
-The SDK key can also be set via the `FEATUREFLIP_SDK_KEY` environment variable.
 
 ## Evaluation
 
@@ -79,7 +83,7 @@ console.log(detail.ruleId);  // Rule ID if reason is "RuleMatch"
 // Track custom events
 client.track('checkout-completed', { user_id: '123' }, { total: 99.99 });
 
-// Identify users for segment building
+// Record an identify event for analytics (does not affect flag evaluation)
 client.identify({ user_id: '123', email: 'user@example.com', plan: 'pro' });
 
 // Force flush pending events
@@ -115,4 +119,4 @@ client.boolVariation('unknown', {}, false);         // false (default)
 
 ## License
 
-MIT
+Apache-2.0

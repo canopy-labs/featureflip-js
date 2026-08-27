@@ -9,6 +9,7 @@ export type EvaluationReason =
   | 'Fallthrough'
   | 'FlagDisabled'
   | 'FlagNotFound'
+  | 'PrerequisiteFailed'
   | 'Error';
 
 export type ConditionOperator =
@@ -26,7 +27,12 @@ export type ConditionOperator =
   | 'LessThan'
   | 'LessThanOrEqual'
   | 'Before'
-  | 'After';
+  | 'After'
+  | 'SemverEquals'
+  | 'SemverGreaterThan'
+  | 'SemverGreaterThanOrEqual'
+  | 'SemverLessThan'
+  | 'SemverLessThanOrEqual';
 
 export interface VariationDto {
   key: string;
@@ -66,6 +72,11 @@ export interface RuleDto {
   segmentKey?: string;
 }
 
+export interface Prerequisite {
+  prerequisiteFlagKey: string;
+  expectedVariationKey: string;
+}
+
 export interface FlagDto {
   key: string;
   version: number;
@@ -75,6 +86,7 @@ export interface FlagDto {
   rules: RuleDto[];
   fallthrough: ServeConfigDto;
   offVariation: string;
+  prerequisites?: Prerequisite[];
 }
 
 export interface SegmentDto {
@@ -96,9 +108,44 @@ export interface EvaluationDetail<T = unknown> {
   variationKey?: string;
   reason: EvaluationReason;
   ruleId?: string;
+  prerequisiteKey?: string;
 }
 
 export type EvaluationContext = Record<string, unknown>;
+
+/**
+ * The object passed to each registered evaluation inspector. Fired once per
+ * variation call, synchronously, during evaluation. `context` is a shallow copy
+ * of the caller's context — treat it as read-only. Optional fields are set only
+ * for their corresponding reason (`ruleId` on `RuleMatch`, `prerequisiteKey` on
+ * `PrerequisiteFailed`).
+ */
+export interface EvaluationEvent {
+  flagKey: string;
+  context: EvaluationContext;
+  value: unknown;
+  variationKey?: string;
+  reason: EvaluationReason;
+  ruleId?: string;
+  prerequisiteKey?: string;
+  timestamp: string;
+}
+
+/** An in-process observer invoked on every flag evaluation. Return value ignored. */
+export type EvaluationInspector = (event: EvaluationEvent) => void;
+
+/** Events a client can be subscribed to via `on`/`off`. */
+export type FeatureflipEvent = 'update';
+
+/**
+ * Called when flag configuration changes after the initial load, with the keys
+ * of the affected flags. Batched: one call per update, however many flags it
+ * touched. Never called with an empty array, and never for the initial load.
+ *
+ * A flag is reported when it is added, removed, its definition changed, or a
+ * segment its rules reference changed. Return value ignored.
+ */
+export type FlagUpdateListener = (keys: string[]) => void;
 
 export interface SdkEventDto {
   type: SdkEventType;
@@ -107,6 +154,10 @@ export interface SdkEventDto {
   variation?: string;
   timestamp: string;
   metadata?: Record<string, unknown>;
+  // Set on `Evaluation` events that resolved `PrerequisiteFailed`, so analytics
+  // can attribute the gating prerequisite. Mirrors the backend `SdkEventDto`
+  // (`PrerequisiteKey`); omitted (not null) on the wire when absent.
+  prerequisiteKey?: string;
 }
 
 export interface RecordEventsRequest {

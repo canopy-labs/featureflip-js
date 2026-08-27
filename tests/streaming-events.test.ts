@@ -81,8 +81,9 @@ describe('SSE event types', () => {
     vi.useFakeTimers();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
+    await FeatureflipClient.resetForTesting();
   });
 
   async function createStreamingClient(platform: ReturnType<typeof createMockPlatform>) {
@@ -91,7 +92,7 @@ describe('SSE event types', () => {
       json: async () => makeFlagResponse(),
     });
 
-    const client = new FeatureflipClient(
+    const client = FeatureflipClient.get(
       { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true },
       platform,
     );

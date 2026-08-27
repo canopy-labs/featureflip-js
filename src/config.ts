@@ -1,3 +1,5 @@
+import type { EvaluationInspector } from './core/types.js';
+
 export interface FeatureflipConfig {
   sdkKey: string;
   baseUrl: string;
@@ -7,6 +9,12 @@ export interface FeatureflipConfig {
   flushBatchSize?: number;
   initTimeout?: number;
   maxStreamRetries?: number;
+  /**
+   * In-process observers fired on every flag evaluation. Honored on the first
+   * `get()` per SDK key (singleton-by-construction); not part of the resolved
+   * config or the config-equality check.
+   */
+  inspectors?: EvaluationInspector[];
 }
 
 export interface ResolvedConfig {
@@ -39,7 +47,7 @@ export function resolveConfig(config: FeatureflipConfig): ResolvedConfig {
 
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
 
-  return {
+  const resolved: ResolvedConfig = {
     sdkKey: config.sdkKey,
     baseUrl,
     streaming: config.streaming ?? DEFAULTS.streaming,
@@ -49,4 +57,30 @@ export function resolveConfig(config: FeatureflipConfig): ResolvedConfig {
     initTimeout: config.initTimeout ?? DEFAULTS.initTimeout,
     maxStreamRetries: config.maxStreamRetries ?? DEFAULTS.maxStreamRetries,
   };
+
+  // Validate numeric config. Invalid values wedge the runtime rather than
+  // failing obviously: a flushBatchSize below 1 makes the event flush loop
+  // splice nothing and hot-spin forever, and a non-positive interval turns a
+  // setInterval into a runaway timer. Reject loudly at construction time,
+  // mirroring the sdkKey/baseUrl checks above.
+  requirePositive('flushInterval', resolved.flushInterval);
+  requirePositive('pollInterval', resolved.pollInterval);
+  requirePositive('initTimeout', resolved.initTimeout);
+  if (!Number.isFinite(resolved.flushBatchSize) || resolved.flushBatchSize < 1) {
+    throw new Error('flushBatchSize must be a number >= 1');
+  }
+  if (
+    !Number.isFinite(resolved.maxStreamRetries) ||
+    resolved.maxStreamRetries < 0
+  ) {
+    throw new Error('maxStreamRetries must be a number >= 0');
+  }
+
+  return resolved;
+}
+
+function requirePositive(name: string, value: number): void {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
 }

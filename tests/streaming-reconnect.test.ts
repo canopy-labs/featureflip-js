@@ -81,8 +81,9 @@ describe('SSE reconnection', () => {
     vi.useFakeTimers();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
+    await FeatureflipClient.resetForTesting();
   });
 
   it('should calculate exponential backoff delays capped at 30s', () => {
@@ -106,7 +107,7 @@ describe('SSE reconnection', () => {
       json: async () => makeFlagResponse(),
     });
 
-    const client = new FeatureflipClient(
+    const client = FeatureflipClient.get(
       { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 3 },
       platform,
     );
@@ -144,7 +145,7 @@ describe('SSE reconnection', () => {
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    const client = new FeatureflipClient(
+    const client = FeatureflipClient.get(
       { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 2 },
       platform,
     );
@@ -186,7 +187,7 @@ describe('SSE reconnection', () => {
       json: async () => makeFlagResponse(),
     });
 
-    const client = new FeatureflipClient(
+    const client = FeatureflipClient.get(
       { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 3 },
       platform,
     );
@@ -210,6 +211,48 @@ describe('SSE reconnection', () => {
     await client.close();
   });
 
+  it('does not reject and serves defaults when the initial fetch fails', async () => {
+    const platform = createMockPlatform();
+    platform.fetchMock.mockRejectedValue(new Error('eval-api down'));
+
+    const client = FeatureflipClient.get(
+      { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 3 },
+      platform,
+    );
+
+    // Must NOT reject even though the initial fetch failed (degraded-but-recovering).
+    await expect(client.waitForInitialization()).resolves.toBeUndefined();
+    expect(client.isInitialized).toBe(true);
+    // Store is empty -> serves the caller default.
+    expect(client.boolVariation('bool-flag', {}, false)).toBe(false);
+    // Data source started despite the failed init, so it can self-heal.
+    expect(platform.mockEventSources).toHaveLength(1);
+
+    await client.close();
+  });
+
+  it('applies a sync snapshot as a full store replace', async () => {
+    const platform = createMockPlatform();
+    platform.fetchMock.mockResolvedValue({ ok: true, json: async () => makeFlagResponse() });
+
+    const client = FeatureflipClient.get(
+      { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true },
+      platform,
+    );
+    await client.waitForInitialization();
+    expect(client.boolVariation('bool-flag', {}, false)).toBe(true);
+
+    // Server sends a sync snapshot on (re)connect that no longer contains bool-flag
+    // (it was deleted while this SDK was disconnected).
+    const emptySnapshot: GetFlagsResponse = { environment: 'test', version: 2, flags: [], segments: [] };
+    platform.mockEventSources[0].emit('sync', JSON.stringify(emptySnapshot));
+
+    // Full replace -> bool-flag is gone -> serves the caller default.
+    expect(client.boolVariation('bool-flag', {}, false)).toBe(false);
+
+    await client.close();
+  });
+
   it('should clean up retry timer on close', async () => {
     const platform = createMockPlatform();
     platform.fetchMock.mockResolvedValue({
@@ -217,7 +260,7 @@ describe('SSE reconnection', () => {
       json: async () => makeFlagResponse(),
     });
 
-    const client = new FeatureflipClient(
+    const client = FeatureflipClient.get(
       { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 5 },
       platform,
     );

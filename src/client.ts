@@ -1,70 +1,113 @@
-import type { FeatureflipConfig, ResolvedConfig } from './config.js';
+import type { FeatureflipConfig } from './config.js';
 import { resolveConfig } from './config.js';
-import { FlagStore } from './core/store.js';
-import { evaluate } from './core/evaluator.js';
-import { EventProcessor } from './core/events.js';
+import { SharedFeatureflipCore, resolvedConfigsEqual } from './core/shared-core.js';
 import type {
   EvaluationContext,
   EvaluationDetail,
+  FeatureflipEvent,
   FlagDto,
-  GetFlagsResponse,
-  SdkEventDto,
-  StreamFlagUpdatedEvent,
+  FlagUpdateListener,
 } from './core/types.js';
-import type { EventSourceLike, Platform } from './platform/types.js';
+import type { Platform } from './platform/types.js';
 
+/**
+ * Process-wide cache of shared cores keyed by SDK key. JS is single-threaded
+ * so a plain Map is sufficient — no locking needed for get-or-create.
+ */
+const liveCores = new Map<string, SharedFeatureflipCore>();
+
+/**
+ * The main client for evaluating feature flags. Obtain instances via the
+ * static factory {@link FeatureflipClient.get}; direct instantiation is not
+ * supported. Multiple `get` calls with the same SDK key return handles
+ * sharing one underlying shared core (refcounted); the shared core shuts
+ * down when the last handle is closed.
+ */
 export class FeatureflipClient {
-  private readonly config: ResolvedConfig;
-  private readonly store: FlagStore;
-  private readonly events: EventProcessor;
-  private readonly platform: Platform;
-  private initialized = false;
-  private initPromise: Promise<void> | null = null;
-  private eventSource: EventSourceLike | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private closed = false;
-  private streamRetryCount = 0;
-  private streamRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly core: SharedFeatureflipCore;
+  private disposed = false;
 
-  constructor(config: FeatureflipConfig, platform: Platform) {
-    this.config = resolveConfig(config);
-    this.store = new FlagStore();
-    this.platform = platform;
+  /**
+   * Unsubscribe callbacks for listeners registered through this handle, so
+   * closing one handle doesn't leave its listeners firing off a shared core
+   * that other handles keep alive.
+   */
+  private readonly subscriptions = new Map<FlagUpdateListener, () => void>();
 
-    this.events = new EventProcessor(
-      {
-        sendEvents: async (request) => {
-          await this.platform.fetch(
-            `${this.config.baseUrl}/v1/sdk/events`,
-            {
-              method: 'POST',
-              headers: this.headers(),
-              body: JSON.stringify(request),
-            },
-          );
-        },
-      },
-      this.config.flushInterval,
-      this.config.flushBatchSize,
-    );
+  /**
+   * Private constructor — reachable only through the static factory and
+   * test helpers. Direct callers see a TypeScript error; runtime JS users
+   * who bypass the type system still work, but this is intentionally
+   * undocumented.
+   */
+  private constructor(core: SharedFeatureflipCore) {
+    this.core = core;
+  }
+
+  /**
+   * Returns a client for the given SDK key. The first call with a given key
+   * constructs and initializes a shared core; subsequent calls with the same
+   * key return a new handle pointing at the cached core. When the last handle
+   * for a key is closed, the core shuts down and is removed from the cache.
+   *
+   * The `platform` argument is honored only on the first call for a given SDK
+   * key. Subsequent callers pass a platform that is silently ignored (since
+   * the shared core already has one).
+   */
+  static get(config: FeatureflipConfig, platform: Platform): FeatureflipClient {
+    if (!config.sdkKey) {
+      throw new Error('sdkKey is required');
+    }
+    const sdkKey = config.sdkKey;
+
+    // Retry loop handles the race where a cached core is found but has already
+    // begun shutting down (refcount hit 0 between lookup and tryAcquire).
+    // In single-threaded JS this loop should rarely iterate more than once,
+    // but the cleanup-and-retry pattern keeps semantics consistent with the
+    // multi-threaded reference implementations (C#, Java).
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const existing = liveCores.get(sdkKey);
+      if (existing) {
+        if (existing.tryAcquire()) {
+          const resolved = resolveConfig(config);
+          if (!resolvedConfigsEqual(existing.config, resolved)) {
+            console.warn(
+              '[featureflip] FeatureflipClient.get called with different options for ' +
+                'an SDK key already in use. The cached instance\'s options are preserved; ' +
+                'the passed options are ignored.',
+            );
+          }
+          return new FeatureflipClient(existing);
+        }
+        // Stale entry — core shut down between lookup and acquire. Drop it.
+        if (liveCores.get(sdkKey) === existing) {
+          liveCores.delete(sdkKey);
+        }
+        continue;
+      }
+
+      const newCore = new SharedFeatureflipCore(config, platform);
+      liveCores.set(sdkKey, newCore);
+      newCore.setOwningMap(liveCores, sdkKey);
+      return new FeatureflipClient(newCore);
+    }
   }
 
   /** Whether the client has successfully loaded initial flag data. */
   get isInitialized(): boolean {
-    return this.initialized;
+    return !this.disposed && this.core.isInitialized;
   }
 
   /**
    * Wait for the client to finish initialization.
-   * Rejects after initTimeout if initial flag fetch fails.
+   *
+   * Resolves once the initial flag fetch completes — or, if that fetch fails or
+   * exceeds `initTimeout`, resolves in a degraded state that serves caller
+   * defaults while the data source reconnects in the background. Never rejects.
    */
   async waitForInitialization(): Promise<void> {
-    if (this.initialized) return;
-
-    if (!this.initPromise) {
-      this.initPromise = this.initialize();
-    }
-    return this.initPromise;
+    return this.core.waitForInitialization();
   }
 
   /**
@@ -76,143 +119,128 @@ export class FeatureflipClient {
     context: EvaluationContext,
     defaultValue: boolean,
   ): boolean {
-    return this.evaluateFlag(key, context, defaultValue);
+    if (this.disposed) return defaultValue;
+    return this.core.evaluateFlag(key, context, defaultValue, 'boolean');
   }
 
-  /**
-   * Evaluate a string flag.
-   */
+  /** Evaluate a string flag. */
   stringVariation(
     key: string,
     context: EvaluationContext,
     defaultValue: string,
   ): string {
-    return this.evaluateFlag(key, context, defaultValue);
+    if (this.disposed) return defaultValue;
+    return this.core.evaluateFlag(key, context, defaultValue, 'string');
   }
 
-  /**
-   * Evaluate a number flag.
-   */
+  /** Evaluate a number flag. */
   numberVariation(
     key: string,
     context: EvaluationContext,
     defaultValue: number,
   ): number {
-    return this.evaluateFlag(key, context, defaultValue);
+    if (this.disposed) return defaultValue;
+    return this.core.evaluateFlag(key, context, defaultValue, 'number');
   }
 
-  /**
-   * Evaluate a JSON flag.
-   */
+  /** Evaluate a JSON flag. */
   jsonVariation<T>(
     key: string,
     context: EvaluationContext,
     defaultValue: T,
   ): T {
-    return this.evaluateFlag(key, context, defaultValue);
+    if (this.disposed) return defaultValue;
+    return this.core.evaluateFlag(key, context, defaultValue);
   }
 
-  /**
-   * Evaluate a flag and return the full detail including reason.
-   */
+  /** Evaluate a flag and return the full detail including reason. */
   variationDetail<T>(
     key: string,
     context: EvaluationContext,
     defaultValue: T,
   ): EvaluationDetail<T> {
-    const flag = this.store.getFlag(key);
-    if (!flag) {
-      this.recordEvaluation(key, context, undefined);
-      return { value: defaultValue, reason: 'FlagNotFound' };
-    }
-
-    try {
-      const result = evaluate(flag, context, {
-        md5: (input) => this.platform.md5(input),
-        getSegment: (segKey) => this.store.getSegment(segKey),
-      });
-
-      const value = result.value !== undefined && result.value !== null
-        ? (result.value as T)
-        : defaultValue;
-      this.recordEvaluation(key, context, result.variationKey);
-
-      return {
-        value,
-        reason: result.reason,
-        ruleId: result.ruleId,
-      };
-    } catch {
-      this.recordEvaluation(key, context, undefined);
-      return { value: defaultValue, reason: 'Error' };
-    }
+    // A closed handle serves the caller's default (#2310). close() releases the
+    // core — shutting down SSE, clearing timers, flushing events — but the
+    // in-memory store stays readable, so without this guard the handle would
+    // keep serving a frozen snapshot that can never update again.
+    if (this.disposed) return { value: defaultValue, reason: 'Error' };
+    return this.core.variationDetail(key, context, defaultValue);
   }
 
   /**
-   * Track a custom event.
+   * Subscribe to flag-configuration updates.
+   *
+   * The listener receives the keys of the flags affected by each update —
+   * added, removed, redefined, whose referenced segment changed, or which
+   * depend (transitively) on a changed flag via a prerequisite — batched into
+   * one call per update. It does not fire for the initial flag load; use
+   * {@link waitForInitialization} for that.
+   *
+   * Returns an unsubscribe function. Listeners are also dropped automatically
+   * when this handle is closed.
    */
+  on(event: FeatureflipEvent, listener: FlagUpdateListener): () => void {
+    // Re-registering the same listener on the same handle is a no-op, matching
+    // addEventListener semantics.
+    const existing = this.subscriptions.get(listener);
+    if (existing) return existing;
+
+    // Register a distinct wrapper per handle: the core dedupes by identity, so
+    // two handles sharing a core and passing the same function would otherwise
+    // collapse into one subscription that either handle's close could revoke.
+    const unsubscribeCore = this.core.onUpdate((keys) => listener(keys));
+    const unsubscribe = () => {
+      unsubscribeCore();
+      this.subscriptions.delete(listener);
+    };
+    this.subscriptions.set(listener, unsubscribe);
+    return unsubscribe;
+  }
+
+  /** Remove a listener previously registered with {@link on}. */
+  off(event: FeatureflipEvent, listener: FlagUpdateListener): void {
+    this.subscriptions.get(listener)?.();
+  }
+
+  /** Track a custom event. */
   track(
     eventKey: string,
     context: EvaluationContext,
     metadata?: Record<string, unknown>,
   ): void {
-    const userId =
-      context.user_id != null ? String(context.user_id) : undefined;
-
-    this.events.enqueue({
-      type: 'Custom',
-      flagKey: eventKey,
-      userId,
-      timestamp: new Date().toISOString(),
-      metadata,
-    });
+    if (this.disposed) return;
+    this.core.track(eventKey, context, metadata);
   }
 
-  /**
-   * Send an identify event for the given context.
-   */
+  /** Send an identify event for the given context. */
   identify(context: EvaluationContext): void {
-    const userId =
-      context.user_id != null ? String(context.user_id) : undefined;
-
-    const { user_id: _, ...metadata } = context;
-
-    this.events.enqueue({
-      type: 'Identify',
-      flagKey: '$identify',
-      userId,
-      timestamp: new Date().toISOString(),
-      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-    });
+    if (this.disposed) return;
+    this.core.identify(context);
   }
 
-  /**
-   * Flush any pending events immediately.
-   */
+  /** Flush any pending events immediately. */
   async flush(): Promise<void> {
-    await this.events.flush();
+    return this.core.flush();
   }
 
   /**
-   * Close the client, flushing pending events and stopping all connections.
+   * Close this handle. If this is the last handle for the shared core, the
+   * core is shut down (connections closed, events flushed, timers cleared).
+   * Double-close on the same handle is idempotent and does not double-decrement.
    */
   async close(): Promise<void> {
-    this.closed = true;
-    this.eventSource?.close();
-    this.eventSource = null;
-    if (this.streamRetryTimer) {
-      clearTimeout(this.streamRetryTimer);
-      this.streamRetryTimer = null;
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const unsubscribe of [...this.subscriptions.values()]) {
+      unsubscribe();
     }
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
-    await this.events.close();
+    await this.core.release();
   }
 
   /**
-   * Create a test client with hardcoded flag values. No network calls.
+   * Create a test client with hardcoded flag values. No network calls, no
+   * cache entry. Each call returns an independent client backed by its own
+   * shared core.
    */
   static forTesting(
     flags: Record<string, unknown>,
@@ -234,211 +262,44 @@ export class FeatureflipClient {
       offVariation: 'default',
     }));
 
-    const noopPlatform: Platform = {
-      md5: () => new Uint8Array(16),
-      createEventSource: () => ({
-        addEventListener: () => {},
-        close: () => {},
-        readyState: 2,
-      }),
-      fetch: async () => new Response(),
-    };
-
-    const client = new FeatureflipClient(
-      { sdkKey: 'test-key', baseUrl: 'http://localhost' },
-      noopPlatform,
-    );
-
-    client.store.init(flagDtos, [], 1);
-    client.initialized = true;
-    return client;
+    const core = SharedFeatureflipCore.createForTesting(flagDtos);
+    return new FeatureflipClient(core);
   }
 
-  // --- Private ---
-
-  private evaluateFlag<T>(
-    key: string,
-    context: EvaluationContext,
-    defaultValue: T,
-  ): T {
-    const detail = this.variationDetail(key, context, defaultValue);
-    return detail.value;
+  /**
+   * Current number of live shared cores in the factory cache. Diagnostic only.
+   * @internal
+   */
+  static get debugLiveCoreCount(): number {
+    return liveCores.size;
   }
 
-  private async initialize(): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error('Initialization timed out')),
-        this.config.initTimeout,
-      );
-    });
-
-    const initPromise = (async () => {
-      await this.fetchFlags();
-      this.initialized = true;
-      this.events.start();
-      this.startDataSource();
-    })();
-
-    try {
-      await Promise.race([initPromise, timeoutPromise]);
-    } finally {
-      clearTimeout(timer);
-    }
+  /**
+   * Returns the shared core's current refcount for the given SDK key, or 0 if
+   * no core is cached for that key. Diagnostic only.
+   * @internal
+   */
+  static debugRefCount(sdkKey: string): number {
+    return liveCores.get(sdkKey)?.debugRefCount ?? 0;
   }
 
-  private async fetchFlags(): Promise<void> {
-    const response = await this.platform.fetch(
-      `${this.config.baseUrl}/v1/sdk/flags`,
-      { headers: this.headers() },
-    );
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch flags: ${response.status}`);
-    }
-
-    const data = (await response.json()) as GetFlagsResponse;
-    this.store.init(data.flags, data.segments, data.version);
-  }
-
-  private startDataSource(): void {
-    if (this.closed) return;
-
-    if (this.config.streaming) {
-      this.startStreaming();
-    } else {
-      this.startPolling();
-    }
-  }
-
-  private startStreaming(): void {
-    if (this.closed) return;
-
-    // Browser EventSource doesn't support custom headers, so the SDK key
-    // must be passed as a query parameter. Node.js eventsource supports
-    // headers, so we avoid leaking the key in the URL (it ends up in
-    // server access logs, CDN logs, and proxy logs).
-    const streamUrl = this.platform.sseSupportsHeaders
-      ? `${this.config.baseUrl}/v1/sdk/stream`
-      : `${this.config.baseUrl}/v1/sdk/stream?authorization=${encodeURIComponent(this.config.sdkKey)}`;
-    this.eventSource = this.platform.createEventSource(streamUrl, this.headers());
-
-    // flag.created and flag.updated — fetch the single flag
-    for (const eventType of ['flag.created', 'flag.updated']) {
-      this.eventSource.addEventListener(
-        eventType,
-        (event: { data: string }) => {
-          try {
-            const update = JSON.parse(event.data) as StreamFlagUpdatedEvent;
-            if (update.key) {
-              void this.fetchSingleFlag(update.key);
-            }
-          } catch {
-            // Ignore parse errors
-          }
-        },
-      );
-    }
-
-    // flag.deleted — remove from store
-    this.eventSource.addEventListener(
-      'flag.deleted',
-      (event: { data: string }) => {
-        try {
-          const update = JSON.parse(event.data) as StreamFlagUpdatedEvent;
-          if (update.key) {
-            this.store.delete(update.key);
-          }
-        } catch {
-          // Ignore parse errors
+  /**
+   * Reset the factory cache. For test isolation only — forces shutdown of
+   * each currently-cached core. Handles that callers still hold will be
+   * invalidated (their subsequent operations still work on the core's
+   * in-memory state but background tasks are stopped).
+   * @internal
+   */
+  static async resetForTesting(): Promise<void> {
+    const cores = [...liveCores.values()];
+    liveCores.clear();
+    await Promise.all(
+      cores.map(async (core) => {
+        // Force-drop the refcount regardless of how many handles are live.
+        while (core.debugRefCount > 0 && !core.isShutDown) {
+          await core.release();
         }
-      },
+      }),
     );
-
-    // segment.updated — refetch all flags
-    this.eventSource.addEventListener(
-      'segment.updated',
-      () => {
-        void this.fetchFlags().catch(() => {
-          // Refetch failures are silent
-        });
-      },
-    );
-
-    this.eventSource.addEventListener('open', () => {
-      this.streamRetryCount = 0;
-    });
-
-    this.eventSource.addEventListener('error', () => {
-      this.eventSource?.close();
-      this.eventSource = null;
-
-      if (this.closed) return;
-
-      if (this.streamRetryCount >= this.config.maxStreamRetries) {
-        console.warn(
-          `[featureflip] SSE connection failed after ${this.config.maxStreamRetries} retries, falling back to polling`,
-        );
-        this.startPolling();
-        return;
-      }
-
-      const delay = Math.min(1000 * Math.pow(2, this.streamRetryCount), 30_000);
-      this.streamRetryCount++;
-      this.streamRetryTimer = setTimeout(() => {
-        this.streamRetryTimer = null;
-        this.startStreaming();
-      }, delay);
-    });
-  }
-
-  private startPolling(): void {
-    this.pollTimer = setInterval(() => {
-      void this.fetchFlags().catch(() => {
-        // Polling failures are silent
-      });
-    }, this.config.pollInterval);
-  }
-
-  private async fetchSingleFlag(key: string): Promise<void> {
-    try {
-      const response = await this.platform.fetch(
-        `${this.config.baseUrl}/v1/sdk/flags/${encodeURIComponent(key)}`,
-        { headers: this.headers() },
-      );
-      if (response.ok) {
-        const flag = (await response.json()) as FlagDto;
-        this.store.upsert(flag);
-      }
-    } catch {
-      // Flag fetch failures are silent
-    }
-  }
-
-  private recordEvaluation(
-    key: string,
-    context: EvaluationContext,
-    variationKey: string | undefined,
-  ): void {
-    const userId =
-      context.user_id != null ? String(context.user_id) : undefined;
-
-    this.events.enqueue({
-      type: 'Evaluation',
-      flagKey: key,
-      userId,
-      variation: variationKey,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  private headers(): Record<string, string> {
-    return {
-      Authorization: this.config.sdkKey,
-      'Content-Type': 'application/json',
-      ...this.platform.extraHeaders,
-    };
   }
 }
