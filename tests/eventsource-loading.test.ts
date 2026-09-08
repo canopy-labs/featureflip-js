@@ -15,10 +15,10 @@ import { resolve } from 'path';
 // free to rewrite `import()` into `require()` when emitting CommonJS — which is
 // a normal, correct thing for a bundler to do, and would silently restore
 // ERR_REQUIRE_ESM on Node 22.0-22.11 with nothing in the source to show for it.
-// A source-level test cannot see that; the sibling waiver in
-// engines-compat.test.ts guards the source half, and this guards the emitted
-// half. Together they mean the engines floor is only claimed while both the
-// code and the build actually support it.
+// A source-level test cannot see that; the waiver in the workspace-wide
+// tests/engines-compat.test.ts guards the source half, and this guards the
+// emitted half. Together they mean the engines floor is only claimed while
+// both the code and the build actually support it.
 
 const pkgDir = resolve(__dirname, '..');
 const distDir = resolve(pkgDir, 'dist');

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.9.0 — 2026-09-01
+
+### Fixed
+
+- A condition operator is now recognised however it is spelled: `NotEquals`, `notequals`, `NOTEQUALS` and `not_equals` all resolve to the same operator. This SDK previously matched the canonical PascalCase label exactly and treated every other spelling as unrecognised — and an unrecognised operator fails closed (#2262), so a mis-spelled operator matched nobody rather than erroring. The go, ruby and php SDKs each applied a *different* rule: go folded case but kept underscores, so it resolved `notequals` and rejected `not_equals`, while php inserted underscores ahead of PascalCase runs and did exactly the reverse. Each accepted a form the other refused, so one saved rule could serve different variations to two users purely by which SDK their service ran. All four now normalise by removing underscores and folding case — the one rule that is a superset of all four previous ones, so no SDK gets stricter and no configuration that evaluated before stops doing so. (#2374)
+
+- The operator is resolved **once** per condition and every subsequent lookup keys off that value, not just the dispatch arm. The operator name also selects the case-sensitivity set and the numeric-coercion set, so normalising at the dispatch alone would have made a mis-cased `MatchesRegex` match case-insensitively where its canonical spelling does not, and dropped a mis-cased `NotEquals` onto the string path, comparing `"1"` against `"1.0"` lexically. (#2374)
+
+- The fail-closed guarantee is unchanged and re-asserted: this resolves *spellings*, it does not invent operators. A name that is not an operator is still unrecognised and still matches nothing before `negate` can invert it. (#2262)
+
 ## 2.8.0 — 2026-08-26
 
 ### Changed

@@ -520,23 +520,76 @@ describe('evaluateCondition', () => {
       expect(evaluateCondition(cond, { country: 'US' })).toBe(false);
     });
 
-    // This evaluator matches operator labels exactly (PascalCase, as the API
-    // emits them), so a mis-cased label is simply unrecognised and must fail
-    // closed like any other — not invert into a match-everyone.
-    it('treats a mis-cased known operator as unrecognised, both ways', () => {
-      const lower = makeCondition({
-        operator: 'equals' as ConditionDto['operator'],
-        values: ['us'],
+    // Issue #2374: a MIS-CASED label is not an unknown operator. Underscores are
+    // stripped and case folded before dispatch, so every spelling of a known
+    // operator resolves to the same one — the shared definition js, go, ruby and
+    // php now agree on. Only a name that is not an operator at all reaches the
+    // fail-closed path asserted above.
+    it.each([
+      ['equals', ['us'], true],
+      ['EQUALS', ['us'], true],
+      ['notequals', ['ca'], true],
+      ['not_equals', ['ca'], true],
+      ['NOTEQUALS', ['ca'], true],
+      ['NOT_EQUALS', ['ca'], true],
+    ])('resolves mis-cased %s to the known operator', (operator, values, expected) => {
+      const cond = makeCondition({
+        operator: operator as ConditionDto['operator'],
+        values: values as string[],
         negate: false,
       });
-      expect(evaluateCondition(lower, { country: 'US' })).toBe(false);
+      expect(evaluateCondition(cond, { country: 'US' })).toBe(expected);
+    });
 
-      const lowerNegated = makeCondition({
+    // The fail-closed rule of #2262 governs UNKNOWN operators. Once an operator
+    // resolves, `negate` inverts it normally — so a negated mis-cased operator
+    // that matched must return false, and the identical `false` it returned
+    // before #2374 was the fail-closed answer, not this one.
+    it('applies negate normally to a resolved mis-cased operator', () => {
+      const matched = makeCondition({
         operator: 'equals' as ConditionDto['operator'],
         values: ['us'],
         negate: true,
       });
-      expect(evaluateCondition(lowerNegated, { country: 'US' })).toBe(false);
+      expect(evaluateCondition(matched, { country: 'US' })).toBe(false);
+
+      const notMatched = makeCondition({
+        operator: 'equals' as ConditionDto['operator'],
+        values: ['ca'],
+        negate: true,
+      });
+      expect(evaluateCondition(notMatched, { country: 'US' })).toBe(true);
+    });
+
+    // Resolution must not lose the operator's case-sensitivity class. The
+    // normalised label is what CASE_SENSITIVE_OPERATORS is keyed on, so a
+    // mis-cased MatchesRegex that dispatched correctly but missed that lookup
+    // would receive pre-lowercased operands and match case-insensitively.
+    it('keeps a mis-cased case-sensitive operator case-sensitive', () => {
+      const wrongCase = makeCondition({
+        attribute: 'name',
+        operator: 'matchesregex' as ConditionDto['operator'],
+        values: ['^abc$'],
+      });
+      expect(evaluateCondition(wrongCase, { name: 'ABC' })).toBe(false);
+
+      const rightCase = makeCondition({
+        attribute: 'name',
+        operator: 'matchesregex' as ConditionDto['operator'],
+        values: ['^ABC$'],
+      });
+      expect(evaluateCondition(rightCase, { name: 'ABC' })).toBe(true);
+    });
+
+    // Same hazard on the numeric-coercion lookup: a mis-cased equality operator
+    // that skipped it would compare "1" against "1.0" lexically and not match.
+    it('keeps a mis-cased equality operator on the numeric path', () => {
+      const cond = makeCondition({
+        attribute: 'age',
+        operator: 'not_equals' as ConditionDto['operator'],
+        values: ['1.0'],
+      });
+      expect(evaluateCondition(cond, { age: 1 })).toBe(false);
     });
   });
 

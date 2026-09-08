@@ -2,7 +2,6 @@ import type {
   ConditionDto,
   ConditionGroupDto,
   ConditionLogic,
-  ConditionOperator,
   EvaluationContext,
   EvaluationDetail,
   FlagDto,
@@ -53,6 +52,27 @@ function getContextAttribute(
 }
 
 /**
+ * The single definition of "recognised operator" shared by the four string-typed
+ * SDKs (js, go, ruby, php) — see #2374. Strips underscores and folds case, so the
+ * canonical PascalCase the API emits (`NotEquals`), the concatenated form go
+ * accepted (`notequals`, `NOTEQUALS`) and the snake_case form php accepted
+ * (`not_equals`) all resolve to one label.
+ *
+ * Underscore-stripping is what makes this a superset of every SDK's previous rule
+ * rather than a fifth one: go lowercased but kept underscores, so it rejected
+ * `not_equals`; php inserted underscores before PascalCase runs, so it rejected
+ * `notequals`. Each accepted a form the other refused, and js/ruby matched the
+ * PascalCase labels exactly and refused both. Normalising here means no SDK gets
+ * stricter than it was, so no configuration that evaluated before stops doing so.
+ *
+ * The concatenated labels stay unambiguous under this mapping — no two operator
+ * names collide once underscores are removed.
+ */
+function normalizeOperator(operator: string): string {
+  return operator.replace(/_/g, '').toLowerCase();
+}
+
+/**
  * Applies a single operator to an already-normalised value/target set.
  *
  * Returns `null` — NOT `false` — for an operator this evaluator does not
@@ -61,28 +81,30 @@ function getContextAttribute(
  * evaluate" and must never be inverted (see #2262).
  */
 function evaluateOperator(
-  operator: ConditionOperator,
+  operator: string,
   value: string,
   targets: string[],
 ): boolean | null {
+  // `operator` has already been through normalizeOperator, so the labels below
+  // are the concatenated lowercase form rather than the wire PascalCase.
   switch (operator) {
-    case 'Equals':
+    case 'equals':
       return targets.some((t) => value === t);
-    case 'NotEquals':
+    case 'notequals':
       return targets.every((t) => value !== t);
-    case 'Contains':
+    case 'contains':
       return targets.some((t) => value.includes(t));
-    case 'NotContains':
+    case 'notcontains':
       return targets.every((t) => !value.includes(t));
-    case 'StartsWith':
+    case 'startswith':
       return targets.some((t) => value.startsWith(t));
-    case 'EndsWith':
+    case 'endswith':
       return targets.some((t) => value.endsWith(t));
-    case 'In':
+    case 'in':
       return targets.includes(value);
-    case 'NotIn':
+    case 'notin':
       return !targets.includes(value);
-    case 'MatchesRegex':
+    case 'matchesregex':
       // Case-sensitive (engine uses RegexOptions.None): MatchesRegex is in
       // CASE_SENSITIVE_OPERATORS, so value/targets arrive in original case and
       // the pattern carries no `i` flag. Case-insensitivity is opt-in via (?i).
@@ -103,32 +125,32 @@ function evaluateOperator(
     // Relational operators match if the value satisfies the comparison against
     // ANY supplied condition value (mirrors the server engine + C#/Java SDKs).
     // Empty `values` yields false via `.some` over an empty array.
-    case 'GreaterThan':
+    case 'greaterthan':
       return targets.some((t) => compareNumeric(value, t, '>'));
-    case 'GreaterThanOrEqual':
+    case 'greaterthanorequal':
       return targets.some((t) => compareNumeric(value, t, '>='));
-    case 'LessThan':
+    case 'lessthan':
       return targets.some((t) => compareNumeric(value, t, '<'));
-    case 'LessThanOrEqual':
+    case 'lessthanorequal':
       return targets.some((t) => compareNumeric(value, t, '<='));
     // Date operators parse both operands as real UTC instants (honoring TZ
     // offsets, assuming UTC when none is given, with a unix-seconds fallback)
     // before comparing — mirroring the engine's CompareDateTime. Unparseable
     // operands contribute no match (never a lexical fallback). Like the
     // relational operators above, match against ANY supplied condition value.
-    case 'Before':
+    case 'before':
       return targets.some((t) => compareDate(value, t, '<'));
-    case 'After':
+    case 'after':
       return targets.some((t) => compareDate(value, t, '>'));
-    case 'SemverEquals':
+    case 'semverequals':
       return targets.some((t) => compareSemver(value, t, '='));
-    case 'SemverGreaterThan':
+    case 'semvergreaterthan':
       return targets.some((t) => compareSemver(value, t, '>'));
-    case 'SemverGreaterThanOrEqual':
+    case 'semvergreaterthanorequal':
       return targets.some((t) => compareSemver(value, t, '>='));
-    case 'SemverLessThan':
+    case 'semverlessthan':
       return targets.some((t) => compareSemver(value, t, '<'));
-    case 'SemverLessThanOrEqual':
+    case 'semverlessthanorequal':
       return targets.some((t) => compareSemver(value, t, '<='));
     default:
       // Unrecognised operator — "cannot evaluate", not "did not match".
@@ -551,25 +573,35 @@ function compareSemver(
 // whose `T`/`Z` designators are case-sensitive — folding would break parsing
 // (#1455). Every other operator here matches case-insensitively, so casing is
 // folded up front only for those.
-const CASE_SENSITIVE_OPERATORS: ReadonlySet<ConditionOperator> = new Set([
-  'SemverEquals',
-  'SemverGreaterThan',
-  'SemverGreaterThanOrEqual',
-  'SemverLessThan',
-  'SemverLessThanOrEqual',
-  'MatchesRegex',
-  'Before',
-  'After',
+//
+// Keyed on the NORMALISED label (#2374). This set decides whether operands are
+// folded to lowercase before dispatch, so a mis-cased `matchesregex` that missed
+// this lookup would be recognised by the switch yet handed pre-lowercased
+// operands — matching case-insensitively while the correctly-cased spelling of
+// the same operator did not.
+const CASE_SENSITIVE_OPERATORS: ReadonlySet<string> = new Set([
+  'semverequals',
+  'semvergreaterthan',
+  'semvergreaterthanorequal',
+  'semverlessthan',
+  'semverlessthanorequal',
+  'matchesregex',
+  'before',
+  'after',
 ]);
 
 // Equality-family operators that compare numerically when the raw attribute is
 // a number (#1458). Mirrors the .NET engine: only these coerce — never
 // Contains/StartsWith/EndsWith, which stay string-based.
-const NUMERIC_EQUALITY_OPERATORS: ReadonlySet<ConditionOperator> = new Set([
-  'Equals',
-  'NotEquals',
-  'In',
-  'NotIn',
+// Keyed on the NORMALISED label, for the same reason as CASE_SENSITIVE_OPERATORS
+// above: a mis-cased equality operator that missed this lookup would skip numeric
+// coercion and fall through to the string path, so `1 not_equals "2"` would
+// compare "1" against "2" lexically instead of numerically (#2374).
+const NUMERIC_EQUALITY_OPERATORS: ReadonlySet<string> = new Set([
+  'equals',
+  'notequals',
+  'in',
+  'notin',
 ]);
 
 // Strictly parse a condition literal as a finite number for the numeric
@@ -596,6 +628,12 @@ function evaluateCondition(
     return condition.negate;
   }
 
+  // Resolve the operator ONCE. Every subsequent decision that keys off the
+  // operator — numeric coercion, case folding, dispatch — must read the same
+  // normalised label, or a mis-cased operator takes some paths and not others
+  // (#2374).
+  const operator = normalizeOperator(condition.operator);
+
   // Type-aware numeric equality (#1458): when the raw attribute is a finite
   // number (booleans are typeof 'boolean', so naturally excluded) and the
   // operator is an equality-family op, compare numerically BEFORE stringifying.
@@ -605,26 +643,25 @@ function evaluateCondition(
   if (
     typeof attrValue === 'number' &&
     Number.isFinite(attrValue) &&
-    NUMERIC_EQUALITY_OPERATORS.has(condition.operator)
+    NUMERIC_EQUALITY_OPERATORS.has(operator)
   ) {
     const anyEqual = condition.values.some((v) => {
       const n = parseNumericStrict(v);
       return n !== null && n === attrValue;
     });
-    const positive =
-      condition.operator === 'Equals' || condition.operator === 'In';
+    const positive = operator === 'equals' || operator === 'in';
     const result = positive ? anyEqual : !anyEqual;
     return condition.negate ? !result : result;
   }
 
-  const caseSensitive = CASE_SENSITIVE_OPERATORS.has(condition.operator);
+  const caseSensitive = CASE_SENSITIVE_OPERATORS.has(operator);
   const rawValue = String(attrValue);
   const strValue = caseSensitive ? rawValue : rawValue.toLowerCase();
   const targets = caseSensitive
     ? condition.values
     : condition.values.map((v) => v.toLowerCase());
 
-  const result = evaluateOperator(condition.operator, strValue, targets);
+  const result = evaluateOperator(operator, strValue, targets);
 
   // Issue #2262: an unrecognised operator fails CLOSED. Letting `negate` invert
   // it would turn "I cannot evaluate this" into "matches every user" — a flag
