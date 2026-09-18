@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.10.0 — 2026-09-18
+
+### Fixed
+
+- The polling fallback no longer ends the SSE stream. After `maxStreamRetries` (5) consecutive failures — about 31 seconds of unreachability, so an edge incident, a bad deploy or a network partition — this SDK started polling and stopped retrying the stream, and nothing ever re-opened it: the process lost real-time updates for the rest of its life and polled `/v1/sdk/flags` on every interval forever. Flag changes, kill switches included, then arrived up to a poll interval late. Polling is now additive — it covers the outage while the stream keeps retrying underneath at the capped backoff, and the next delivered `sync` retires the poller. Retiring it matters as much as arming it: a poller left running beside a healthy stream reverts SSE deltas with its own whole-store replaces. (#3071)
+- The reconnect delay is now jittered to `[d/2, d]` at every level. This was the one backoff in the fleet without jitter, and the drops it absorbs are fleet-wide — a single edge event severs every stream at once — so every client re-entered the backoff together and waited an identical delay. Unbounded retrying (above) would have turned that from one reconnect spike into a permanently synchronised one. (#3071)
+- The consecutive-failure counter now resets on a delivered `sync` rather than on the `open` event. A server that accepts a connection and closes it without sending anything satisfied `open` on every cycle, so the counter never accumulated: this SDK reconnected at a flat 1s indefinitely and never reached its own fallback. Every other Featureflip SDK resets on a delivered frame. (#3071)
+
 ## 2.9.0 — 2026-09-01
 
 ### Fixed

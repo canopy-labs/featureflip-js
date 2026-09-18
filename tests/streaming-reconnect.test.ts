@@ -86,18 +86,45 @@ describe('SSE reconnection', () => {
     await FeatureflipClient.resetForTesting();
   });
 
-  it('should calculate exponential backoff delays capped at 30s', () => {
-    const getBackoffDelay = (attempt: number): number => {
-      return Math.min(1000 * Math.pow(2, attempt), 30_000);
-    };
+  it('escalates the reconnect delay, caps it at 30s, and jitters every level', async () => {
+    // Asserted against the SDK's own scheduling, not a formula retyped into the
+    // test: the version this replaces re-implemented the delay locally and so
+    // would have passed unchanged no matter what the SDK did.
+    const platform = createMockPlatform();
+    platform.fetchMock.mockResolvedValue({ ok: true, json: async () => makeFlagResponse() });
 
-    expect(getBackoffDelay(0)).toBe(1000);   // 1s
-    expect(getBackoffDelay(1)).toBe(2000);   // 2s
-    expect(getBackoffDelay(2)).toBe(4000);   // 4s
-    expect(getBackoffDelay(3)).toBe(8000);   // 8s
-    expect(getBackoffDelay(4)).toBe(16000);  // 16s
-    expect(getBackoffDelay(5)).toBe(30000);  // capped at 30s
-    expect(getBackoffDelay(10)).toBe(30000); // still capped
+    // Math.random() === 1 puts the jittered delay at the top of its [d/2, d] band,
+    // which is the pre-jitter delay — so the ceilings stay exactly assertable.
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(1);
+
+    const client = FeatureflipClient.get(
+      { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 99 },
+      platform,
+    );
+    await client.waitForInitialization();
+
+    for (const ceiling of [1000, 2000, 4000, 8000, 16000, 30_000, 30_000]) {
+      const before = platform.mockEventSources.length;
+      platform.mockEventSources[before - 1].emit('error');
+
+      // Nothing one millisecond early...
+      await vi.advanceTimersByTimeAsync(ceiling - 1);
+      expect(platform.mockEventSources).toHaveLength(before);
+      // ...and exactly one reconnect on the boundary.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(platform.mockEventSources).toHaveLength(before + 1);
+    }
+
+    // The jitter itself: the drops this absorbs are fleet-wide (#2457), so a
+    // constant first delay reconnects every client in lockstep (#2508).
+    randomSpy.mockReturnValue(0);
+    const before = platform.mockEventSources.length;
+    platform.mockEventSources[before - 1].emit('error');
+    await vi.advanceTimersByTimeAsync(15_000); // half of the 30s ceiling
+    expect(platform.mockEventSources).toHaveLength(before + 1);
+
+    randomSpy.mockRestore();
+    await client.close();
   });
 
   it('should reconnect with exponential backoff on error', async () => {
@@ -136,7 +163,10 @@ describe('SSE reconnection', () => {
     await client.close();
   });
 
-  it('should fall back to polling after max retries exceeded', async () => {
+  it('falls back to polling after max retries AND keeps retrying the stream', async () => {
+    // #3071: the fallback is additive. It used to `return`, so nothing ever
+    // re-opened the stream — the process polled, blind to real-time updates
+    // (kill switches included), until it restarted.
     const platform = createMockPlatform();
     platform.fetchMock.mockResolvedValue({
       ok: true,
@@ -164,23 +194,76 @@ describe('SSE reconnection', () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(platform.mockEventSources).toHaveLength(3);
 
-    // Third error -> max retries exceeded, should fall back to polling
+    // Third error -> the fallback arms, and the stream retries underneath it.
     platform.mockEventSources[2].emit('error');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(platform.mockEventSources).toHaveLength(4);
 
-    // No new EventSource should be created
-    await vi.advanceTimersByTimeAsync(10000);
-    expect(platform.mockEventSources).toHaveLength(3);
-
-    // Warning should have been logged
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('falling back to polling'),
     );
+    // Armed once, not re-announced on every failure past the threshold.
+    const fallbackWarnings = warnSpy.mock.calls.filter(([msg]) =>
+      typeof msg === 'string' && msg.includes('falling back to polling'),
+    );
+    platform.mockEventSources[3].emit('error');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(platform.mockEventSources).toHaveLength(5);
+    expect(
+      warnSpy.mock.calls.filter(([msg]) =>
+        typeof msg === 'string' && msg.includes('falling back to polling'),
+      ),
+    ).toHaveLength(fallbackWarnings.length);
 
     warnSpy.mockRestore();
     await client.close();
   });
 
-  it('should reset retry count on successful connection', async () => {
+  it('retires the fallback poller once the stream delivers a sync again', async () => {
+    const platform = createMockPlatform();
+    platform.fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => makeFlagResponse(),
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const client = FeatureflipClient.get(
+      {
+        sdkKey: 'test-key',
+        baseUrl: 'http://localhost:5000',
+        streaming: true,
+        maxStreamRetries: 0,
+        pollInterval: 1000,
+      },
+      platform,
+    );
+    await client.waitForInitialization();
+
+    // Straight to the fallback (maxStreamRetries: 0), then let it poll twice.
+    platform.mockEventSources[0].emit('error');
+    const afterInit = platform.fetchMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(platform.fetchMock.mock.calls.length).toBeGreaterThan(afterInit);
+
+    // The stream comes back and replays its snapshot: the poller is now redundant,
+    // and leaving it running means one request per interval per instance forever —
+    // plus whole-store replaces that revert deltas this stream applies.
+    const latest = platform.mockEventSources[platform.mockEventSources.length - 1];
+    latest.emit('sync', JSON.stringify(makeFlagResponse()));
+
+    const afterRecovery = platform.fetchMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(platform.fetchMock.mock.calls.length).toBe(afterRecovery);
+
+    warnSpy.mockRestore();
+    await client.close();
+  });
+
+  it('resets the retry count on a delivered sync, not on a bare open', async () => {
+    // An accept-then-close server satisfies `open` on every cycle. Resetting there
+    // meant the counter never accumulated, so this SDK reconnected at a flat 1s
+    // forever and never reached its own fallback. Every other SDK in the fleet
+    // resets on a delivered frame.
     const platform = createMockPlatform();
     platform.fetchMock.mockResolvedValue({
       ok: true,
@@ -188,25 +271,30 @@ describe('SSE reconnection', () => {
     });
 
     const client = FeatureflipClient.get(
-      { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 3 },
+      { sdkKey: 'test-key', baseUrl: 'http://localhost:5000', streaming: true, maxStreamRetries: 99 },
       platform,
     );
     await client.waitForInitialization();
 
-    // First error
+    // Accept-then-close twice: the delay must keep escalating.
+    platform.mockEventSources[0].emit('open');
     platform.mockEventSources[0].emit('error');
     await vi.advanceTimersByTimeAsync(1000);
     expect(platform.mockEventSources).toHaveLength(2);
 
-    // Simulate successful reconnection (open event)
     platform.mockEventSources[1].emit('open');
-
-    // Another error after successful connection
     platform.mockEventSources[1].emit('error');
-
-    // Should retry with 1s delay again (retry count was reset)
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(platform.mockEventSources)
+      .toHaveLength(2); // 1s is no longer enough — the second delay is [1s, 2s]
     await vi.advanceTimersByTimeAsync(1000);
     expect(platform.mockEventSources).toHaveLength(3);
+
+    // A delivered sync is what actually resets it.
+    platform.mockEventSources[2].emit('sync', JSON.stringify(makeFlagResponse()));
+    platform.mockEventSources[2].emit('error');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(platform.mockEventSources).toHaveLength(4);
 
     await client.close();
   });

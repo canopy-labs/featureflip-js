@@ -74,6 +74,12 @@ export class SharedFeatureflipCore {
   private closed = false;
   private streamRetryCount = 0;
   private streamRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * True between arming the polling fallback and the next delivered `sync`. Gates
+   * the reap so a poller the caller configured (`streaming: false`) is never
+   * mistaken for one this SDK armed to cover an outage.
+   */
+  private pollingIsStreamFallback = false;
 
   /** Number of outstanding handles (including the one returned by the factory). */
   private refCount = 1;
@@ -379,6 +385,7 @@ export class SharedFeatureflipCore {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.pollingIsStreamFallback = false;
     await this.events.close();
   }
 
@@ -557,12 +564,16 @@ export class SharedFeatureflipCore {
         } catch (err) {
           this.warnIfMalformed(err, 'sync snapshot');
         }
+        // A delivered snapshot — not merely an accepted socket — is what proves the
+        // stream healthy, and it is the condition every other SDK in the fleet
+        // resets on. Resetting on `open` let an accept-then-close server clear the
+        // counter every cycle, so this SDK reconnected at a flat 1s forever and
+        // never reached its own fallback. Counted even on a malformed payload: the
+        // stream itself is up, and the parse failure has already been reported.
+        this.streamRetryCount = 0;
+        this.stopStreamFallbackPolling();
       },
     );
-
-    es.addEventListener('open', () => {
-      this.streamRetryCount = 0;
-    });
 
     es.addEventListener('error', () => {
       // Ignore an error from a stream we have already replaced or torn down.
@@ -576,21 +587,62 @@ export class SharedFeatureflipCore {
 
       if (this.closed) return;
 
-      if (this.streamRetryCount >= this.config.maxStreamRetries) {
+      // The fallback is ADDITIVE, never terminal (#3071). Polling covers the outage;
+      // the stream keeps retrying underneath at the capped backoff, and the next
+      // delivered `sync` retires the poller. Returning here left the process polling
+      // — and blind to real-time updates, kill switches included — until it
+      // restarted, after only ~31s of unreachability.
+      if (
+        this.streamRetryCount >= this.config.maxStreamRetries &&
+        !this.pollingIsStreamFallback
+      ) {
         console.warn(
-          `[featureflip] SSE connection failed after ${this.config.maxStreamRetries} retries, falling back to polling`,
+          `[featureflip] SSE connection failed after ${this.config.maxStreamRetries} retries, ` +
+            'falling back to polling while the stream keeps retrying',
         );
+        this.pollingIsStreamFallback = true;
         this.startPolling();
-        return;
       }
 
-      const delay = Math.min(1000 * Math.pow(2, this.streamRetryCount), 30_000);
+      const delay = this.streamReconnectDelay();
       this.streamRetryCount++;
       this.streamRetryTimer = setTimeout(() => {
         this.streamRetryTimer = null;
         void this.startStreaming();
       }, delay);
     });
+  }
+
+  /**
+   * Capped exponential reconnect backoff, jittered to [d/2, d] at every level.
+   *
+   * The jitter is load-bearing on the FIRST reconnect, not only the escalating
+   * ones: these drops are fleet-wide — one edge event severs every stream at once
+   * (#2457) — so every client re-enters here at the same failure count together,
+   * and a constant there republishes the drop's own synchronisation as a reconnect
+   * spike one delay later (#2508). Unbounded retrying (#3071) makes that permanent
+   * rather than one-off, which is why this SDK can no longer be the fleet's one
+   * un-jittered backoff. The band's lower bound is strictly positive, so a clean
+   * sever still cannot busy-loop.
+   */
+  private streamReconnectDelay(): number {
+    const ceiling = Math.min(1000 * Math.pow(2, this.streamRetryCount), 30_000);
+    const half = ceiling / 2;
+    return half + Math.random() * half;
+  }
+
+  /**
+   * Retires a polling fallback armed to cover an SSE outage, leaving a poller the
+   * caller asked for (`streaming: false`) alone.
+   */
+  private stopStreamFallbackPolling(): void {
+    if (!this.pollingIsStreamFallback) return;
+
+    this.pollingIsStreamFallback = false;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
   }
 
   private startPolling(): void {
