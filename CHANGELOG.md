@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.11.0 — 2026-10-07
+
+### Changed
+
+- Republished in lockstep with `@featureflip/browser` 2.11.0. This package had no source changes of its own, and it is not affected by the browser SDK's new flag read reporting: read reporting is a client-side SDK change that this server-side SDK does not make. Recorded here because the npm release tag publishes all four JavaScript packages at a single version, so this version exists on npm with no change of its own to describe. (#3545)
+
 ## 2.10.0 — 2026-09-18
 
 ### Fixed

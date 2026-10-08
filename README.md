@@ -90,6 +90,8 @@ client.identify({ user_id: '123', email: 'user@example.com', plan: 'pro' });
 await client.flush();
 ```
 
+Featureflip counts each event name, per environment. The metadata you pass is transmitted with the event but is not stored, and event counts are not surfaced in the app or API.
+
 ## Testing
 
 Use `forTesting()` to create a client with predetermined flag values -- no network calls.
