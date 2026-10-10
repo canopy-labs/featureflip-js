@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.11.1 — 2026-10-09
+
+### Changed
+
+- `package.json` now declares `"sideEffects": false`. Loading the package does nothing on its own: no globals, no timers, no listeners, no patched built-ins. Bundlers (webpack, Rollup, esbuild, Vite) can now drop an unused import of it and tree-shake its unused exports, where before they had to keep the whole module in case loading it mattered. A test now loads all four of its builds (`node` and `browser`, each as ESM and CommonJS) in a clean Node process on every change and fails if that stops being true. No runtime behaviour changes. (#3562)
+
 ## 2.11.0 — 2026-10-07
 
 ### Changed

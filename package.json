@@ -1,6 +1,6 @@
 {
   "name": "@featureflip/js",
-  "version": "2.11.0",
+  "version": "2.11.1",
   "description": "JavaScript/TypeScript SDK for Featureflip",
   "keywords": [
     "feature-flags",
@@ -36,6 +36,7 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "scripts": {
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
