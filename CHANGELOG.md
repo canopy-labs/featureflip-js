@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.12.0 — 2026-10-20
+
+### Changed
+
+- Republished in lockstep with `@featureflip/browser` 2.12.0. This package has no source changes of its own; the new `bootstrap` option is browser-only. Recorded here because the npm release tag publishes all four JavaScript packages at a single version. (#4095)
+
 ## 2.11.1 — 2026-10-09
 
 ### Changed
