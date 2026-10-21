@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.13.0 — 2026-10-20
+
+### Added
+
+- Every request now names the SDK and its version: `featureflip-js/<version>`. Node sends it as `User-Agent`, as before. The browser platform previously sent nothing that identified the SDK (a script cannot set `User-Agent` there), and now sends it as `X-Featureflip-SDK`, which is also what a custom `Platform` gets unless it sets the new `identityHeader`. The SSE stream in a browser still carries neither, because the native `EventSource` sends no custom headers. (#4144)
+- A `wrappers` option for libraries that wrap this SDK, such as `@featureflip/node` or an OpenFeature provider. Each `name/version` token is sent, in order, after the SDK's own, so usage through the wrapper can be counted. An invalid token is ignored with a warning, and differing wrappers do not trigger the "different options" warning. (#4144)
+
 ## 2.12.0 — 2026-10-20
 
 ### Changed

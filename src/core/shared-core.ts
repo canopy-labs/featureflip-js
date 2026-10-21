@@ -24,6 +24,7 @@ import {
   dropUnevaluableEntities,
   unevaluableFlagReason,
 } from './unevaluable.js';
+import { buildIdentity } from './identity.js';
 
 /**
  * Resolve the built-in user id for an analytics event from either the
@@ -66,6 +67,8 @@ export class SharedFeatureflipCore {
   private readonly events: EventProcessor;
   private readonly platform: Platform;
   private readonly inspectors: EvaluationInspector[];
+  /** `featureflip-js/<version>` plus wrapper tokens, built once (#4144). */
+  private readonly identity: string;
   private readonly updateListeners = new Set<FlagUpdateListener>();
   private initialized = false;
   private initPromise: Promise<void> | null = null;
@@ -92,6 +95,9 @@ export class SharedFeatureflipCore {
     this.config = resolveConfig(config);
     this.store = new FlagStore();
     this.platform = platform;
+    // Also from the RAW config, for the same reason as inspectors below: wrappers
+    // identify the caller and must not trip the config-equality warning.
+    this.identity = buildIdentity(config.wrappers);
     // Read from the RAW config — inspectors are deliberately not part of
     // ResolvedConfig (functions aren't structurally comparable, and a differing
     // callback must not trigger the config-equality warning). Filter to
@@ -766,6 +772,7 @@ export class SharedFeatureflipCore {
       Authorization: this.config.sdkKey,
       'Content-Type': 'application/json',
       ...this.platform.extraHeaders,
+      [this.platform.identityHeader ?? 'X-Featureflip-SDK']: this.identity,
     };
   }
 }

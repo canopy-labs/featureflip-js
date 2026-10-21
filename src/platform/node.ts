@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import type { Platform } from './types.js';
+import { SDK_TOKEN } from '../core/identity.js';
 
 interface EventSourceInstance {
   addEventListener(type: string, listener: (event: unknown) => void): void;
@@ -63,9 +64,13 @@ export function createNodePlatform(): Platform {
       return globalThis.fetch(url, init);
     },
 
+    // Kept for callers that read it; the core sends the full identity (with any
+    // wrapper tokens) under identityHeader, which takes precedence.
     extraHeaders: {
-      'User-Agent': `featureflip-js/${__SDK_VERSION__}`,
+      'User-Agent': SDK_TOKEN,
     },
+
+    identityHeader: 'User-Agent',
 
     sseSupportsHeaders: true,
   };

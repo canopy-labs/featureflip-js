@@ -26,6 +26,11 @@ export function createBrowserPlatform(): Platform {
     async fetch(url: string, init?: RequestInit): Promise<Response> {
       return globalThis.fetch(url, init);
     },
+
+    // A script cannot set User-Agent in a browser. The native EventSource above
+    // sends no custom headers either, so stream connects stay unidentified; every
+    // session's flag fetch carries it.
+    identityHeader: 'X-Featureflip-SDK',
   };
 }
 

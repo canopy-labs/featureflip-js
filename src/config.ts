@@ -15,6 +15,15 @@ export interface FeatureflipConfig {
    * config or the config-equality check.
    */
   inspectors?: EvaluationInspector[];
+  /**
+   * `name/version` tokens for libraries that wrap this SDK (node-sdk, an
+   * OpenFeature provider), sent in order after `featureflip-js/<version>` so
+   * usage through each can be counted. An invalid token is ignored with a
+   * warning. Like `inspectors`, honored on the first `get()` per SDK key and
+   * not part of the config-equality check: it identifies the caller rather
+   * than changing behavior.
+   */
+  wrappers?: string[];
 }
 
 export interface ResolvedConfig {

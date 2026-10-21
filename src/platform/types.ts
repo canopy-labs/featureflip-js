@@ -20,6 +20,13 @@ export interface Platform {
   fetch(url: string, init?: RequestInit): Promise<Response>;
   /** Extra headers the platform can inject (e.g. User-Agent on Node). */
   readonly extraHeaders?: Record<string, string>;
+  /**
+   * The header that carries the SDK identity (`featureflip-js/<version>` plus any
+   * wrapper tokens). Node sets `User-Agent`; a browser cannot (the Fetch spec
+   * forbids it), so it uses `X-Featureflip-SDK`, which is also the default for a
+   * platform that does not say, because every runtime allows it.
+   */
+  readonly identityHeader?: 'User-Agent' | 'X-Featureflip-SDK';
   /** Whether the platform's EventSource implementation supports custom headers. */
   readonly sseSupportsHeaders?: boolean;
 }
