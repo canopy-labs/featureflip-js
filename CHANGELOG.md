@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.14.0 — 2026-10-20
+
+### Changed
+
+- Republished in lockstep with `@featureflip/node` 2.14.0 and `@featureflip/react` 2.14.0, which now identify themselves on top of this package's identity token. This package has no source changes of its own. Recorded here because the npm release tag publishes all four JavaScript packages at a single version. (#4145)
+
 ## 2.13.0 — 2026-10-20
 
 ### Added
