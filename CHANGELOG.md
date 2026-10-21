@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.14.1 — 2026-10-21
+
+### Changed
+
+- Internal: variation resolution now lives in a shared `resolveDetail` function, and the event processor gained two opt-in options (no automatic flush on a full batch, a cap on batches per flush), so `@featureflip/edge` can reuse both. Nothing changes for this package's callers: the options are off by default and evaluation results are the same. (#1372)
+
 ## 2.14.0 — 2026-10-20
 
 ### Changed

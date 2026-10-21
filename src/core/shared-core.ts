@@ -1,7 +1,8 @@
 import type { FeatureflipConfig, ResolvedConfig } from '../config.js';
 import { resolveConfig } from '../config.js';
 import { FlagStore } from './store.js';
-import { evaluate } from './evaluator.js';
+import { resolveDetail } from './resolve-detail.js';
+import type { ExpectedValueType } from './resolve-detail.js';
 import { EventProcessor, EventSendError } from './events.js';
 import type {
   EvaluationContext,
@@ -33,20 +34,14 @@ import { buildIdentity } from './identity.js';
  * event's `userId` is silently null whenever a caller passes a `userId`-keyed
  * context (a documented-valid shape), leaving analytics unattributed.
  */
-function resolveEventUserId(
+export function resolveEventUserId(
   context: EvaluationContext,
 ): string | undefined {
   const raw = context.user_id ?? context.userId;
   return raw != null ? String(raw) : undefined;
 }
 
-/**
- * The runtime type a typed accessor requires of the value a flag serves, as
- * reported by `typeof`. Used to detect a type-mismatched read (#2281), which
- * TypeScript cannot catch on its own: its type parameters are erased, so
- * `boolVariation` would otherwise hand back whatever the flag actually served.
- */
-export type ExpectedValueType = 'boolean' | 'string' | 'number';
+export type { ExpectedValueType } from './resolve-detail.js';
 
 /**
  * Internal shared core owning all expensive resources of a FeatureflipClient:
@@ -253,68 +248,23 @@ export class SharedFeatureflipCore {
     expected?: ExpectedValueType,
   ): EvaluationDetail<T> {
     const flag = this.store.getFlag(key);
-    if (!flag) {
-      this.recordEvaluation(key, context, undefined);
-      this.notifyInspectors(key, context, defaultValue, { reason: 'FlagNotFound' });
-      return { value: defaultValue, reason: 'FlagNotFound' };
-    }
+    // A thunk, so resolveDetail builds it inside its guard: a store that throws
+    // here degrades the read to `Error` instead of escaping the variation call.
+    const allFlags = () => Object.fromEntries(this.store.getAllFlags().map((f) => [f.key, f]));
+    const detail = resolveDetail(flag, context, defaultValue, {
+      md5: (input) => this.platform.md5(input),
+      getSegment: (segKey) => this.store.getSegment(segKey),
+    }, allFlags, expected);
 
-    try {
-      const allFlags = Object.fromEntries(
-        this.store.getAllFlags().map((f) => [f.key, f]),
-      );
-      const result = evaluate(flag, context, {
-        md5: (input) => this.platform.md5(input),
-        getSegment: (segKey) => this.store.getSegment(segKey),
-      }, allFlags);
+    this.recordEvaluation(key, context, detail.variationKey, detail.prerequisiteKey);
+    this.notifyInspectors(key, context, detail.value, {
+      variationKey: detail.variationKey,
+      reason: detail.reason,
+      ruleId: detail.ruleId,
+      prerequisiteKey: detail.prerequisiteKey,
+    });
 
-      // Malformed config: the evaluator selected a variation key the flag does
-      // not define (e.g. a fallthrough/rule naming a since-deleted variation).
-      // Degrade to the caller's default and report Error, mirroring the engine's
-      // ServeVariation + the C#/Java SDKs (#1989). A variation that genuinely
-      // exists with a null value is NOT this case — hence the key lookup rather
-      // than a `value === null` check, which cannot tell the two apart.
-      const served = result.variationKey
-        ? flag.variations.find((v) => v.key === result.variationKey)
-        : undefined;
-      let reason: EvaluationReason =
-        result.variationKey && !served ? 'Error' : result.reason;
-
-      let value = result.value !== undefined && result.value !== null
-        ? (result.value as T)
-        : defaultValue;
-
-      // A typed accessor asked for a specific JSON type and the SERVED value is
-      // not it. Degrade to the caller's default and report Error so the mismatch
-      // is detectable, rather than handing back a string where the caller's code
-      // expects a boolean (#2281). Checking `result.value` rather than `value`
-      // matters: a variation whose value is genuinely null has already been
-      // replaced by defaultValue above, and that substitute would pass any check.
-      if (expected && typeof result.value !== expected) {
-        value = defaultValue;
-        reason = 'Error';
-      }
-
-      this.recordEvaluation(key, context, result.variationKey, result.prerequisiteKey);
-      this.notifyInspectors(key, context, value, {
-        variationKey: result.variationKey,
-        reason,
-        ruleId: result.ruleId,
-        prerequisiteKey: result.prerequisiteKey,
-      });
-
-      return {
-        value,
-        variationKey: result.variationKey,
-        reason,
-        ruleId: result.ruleId,
-        prerequisiteKey: result.prerequisiteKey,
-      };
-    } catch {
-      this.recordEvaluation(key, context, undefined);
-      this.notifyInspectors(key, context, defaultValue, { reason: 'Error' });
-      return { value: defaultValue, reason: 'Error' };
-    }
+    return detail;
   }
 
   evaluateFlag<T>(

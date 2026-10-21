@@ -94,11 +94,22 @@ export class EventProcessor {
    */
   private nextAutoFlushAt = 0;
 
+  /**
+   * @param options.flushOnFullBatch Default true: `enqueue` starts a flush once a
+   *   batch is full. A host where only an awaited or `waitUntil`-held promise is
+   *   guaranteed to finish (the edge SDK) turns it off, so no send is ever
+   *   started that nobody waits on; its explicit `flush()` still sends in
+   *   batches of `flushBatchSize`.
+   * @param options.maxBatchesPerFlush Default unlimited: one `flush()` drains the
+   *   queue. A host with a per-invocation subrequest budget (the edge SDK) caps
+   *   the POSTs one flush may make; whatever is left waits for a later flush.
+   */
   constructor(
     private readonly sender: EventSender,
     private readonly flushInterval: number,
     flushBatchSize: number,
     maxQueueSize: number = DEFAULT_MAX_QUEUE_SIZE,
+    private readonly options: { flushOnFullBatch?: boolean; maxBatchesPerFlush?: number } = {},
   ) {
     this.maxQueueSize = maxQueueSize >= 1 ? maxQueueSize : DEFAULT_MAX_QUEUE_SIZE;
     // Defence-in-depth against a non-positive batch size: splice(0, n) with
@@ -106,6 +117,11 @@ export class EventProcessor {
     // queue (see #1917). resolveConfig already rejects such values, but this
     // class is constructed directly too — clamp to >= 1 so it can never spin.
     this.flushBatchSize = flushBatchSize >= 1 ? flushBatchSize : 1;
+  }
+
+  /** Events waiting to be sent, not counting a batch currently in flight. */
+  get size(): number {
+    return this.queue.length;
   }
 
   start(): void {
@@ -119,7 +135,11 @@ export class EventProcessor {
     if (this.closed) return;
     this.queue.push(sanitizeEvent(event));
     this.trimToBound();
-    if (this.queue.length >= this.flushBatchSize && Date.now() >= this.nextAutoFlushAt) {
+    if (
+      this.options.flushOnFullBatch !== false &&
+      this.queue.length >= this.flushBatchSize &&
+      Date.now() >= this.nextAutoFlushAt
+    ) {
       void this.flush();
     }
   }
@@ -131,8 +151,12 @@ export class EventProcessor {
       return this.flushPromise;
     }
 
+    // A cap below 1 would never send anything, so it reads as no cap.
+    const cap = this.options.maxBatchesPerFlush;
+    const maxBatches = cap !== undefined && cap >= 1 ? cap : Infinity;
     this.flushPromise = (async () => {
-      while (this.queue.length > 0) {
+      // Counts every POST, a permanently rejected one included: each is a request.
+      for (let sent = 0; this.queue.length > 0 && sent < maxBatches; sent++) {
         const batch = this.queue.splice(0, this.flushBatchSize);
         try {
           await this.sender.sendEvents({ events: batch });

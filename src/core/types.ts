@@ -87,6 +87,11 @@ export interface FlagDto {
   fallthrough: ServeConfigDto;
   offVariation: string;
   prerequisites?: Prerequisite[];
+  /**
+   * Whether the flag may be exposed to client-side code. Absent on payloads from
+   * servers that predate the field; treat absent as not visible.
+   */
+  clientSideVisible?: boolean;
 }
 
 export interface SegmentDto {
