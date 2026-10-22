@@ -25,6 +25,8 @@ export interface ResolveDeps {
    * pass it; the edge SDK logs them.
    */
   onError?(err: unknown): void;
+  /** Told when a rollout serve is skipped because the context can't be bucketed (#4236). */
+  onUnbucketable?(info: { flagKey: string; ruleId: string | null; bucketBy: string }): void;
 }
 
 /**
@@ -66,6 +68,10 @@ export function resolveDetail<T>(
     const evaluatorDeps = {
       md5: (input: string) => deps.md5(input),
       getSegment: (segKey: string) => deps.getSegment(segKey),
+      onUnbucketable: deps.onUnbucketable
+        ? (info: { flagKey: string; ruleId: string | null; bucketBy: string }) =>
+            deps.onUnbucketable!(info)
+        : undefined,
     };
     const result = memo
       ? evaluateWithSharedMemo(flag, context, evaluatorDeps, flags, memo)

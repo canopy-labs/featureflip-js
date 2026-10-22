@@ -2,6 +2,7 @@ import type { FeatureflipConfig, ResolvedConfig } from '../config.js';
 import { resolveConfig } from '../config.js';
 import { FlagStore } from './store.js';
 import { resolveDetail } from './resolve-detail.js';
+import { warnUnbucketable } from './unbucketable.js';
 import type { ExpectedValueType } from './resolve-detail.js';
 import { EventProcessor, EventSendError } from './events.js';
 import type {
@@ -254,6 +255,7 @@ export class SharedFeatureflipCore {
     const detail = resolveDetail(flag, context, defaultValue, {
       md5: (input) => this.platform.md5(input),
       getSegment: (segKey) => this.store.getSegment(segKey),
+      onUnbucketable: (i) => warnUnbucketable(i),
     }, allFlags, expected);
 
     this.recordEvaluation(key, context, detail.variationKey, detail.prerequisiteKey);

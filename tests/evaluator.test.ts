@@ -851,34 +851,72 @@ describe('evaluate', () => {
     expect(results.has(false)).toBe(true);
   });
 
-  it('serves the control (first) variation for keyless users in a rollout (#1457)', () => {
-    // An anonymous context (no userId/user_id) cannot be bucketed. Rather than
-    // hashing the empty value into an arbitrary salt-dependent bucket, local
-    // eval deterministically serves the control (first) variation. The engine
-    // randomizes per-eval over HTTP — parity is guaranteed only for keyed
-    // contexts (see #1457).
+  const thinRollout = (bucketBy = 'userId') => ({
+    type: 'Rollout' as const,
+    bucketBy,
+    salt: 'test-salt',
+    variations: [
+      { key: 'on', weight: 1 },
+      { key: 'off', weight: 99 },
+    ],
+  });
+
+  it('skips a rollout that cannot bucket a keyless context and serves the fallthrough (#4236)', () => {
+    // Previously the SDK served the rollout's first variation (the one being rolled out).
     const flag = makeFlag({
-      fallthrough: {
-        type: 'Rollout',
-        bucketBy: 'userId',
-        salt: 'test-salt',
-        variations: [
-          // Control is a thin slice so the old empty-hash collapse would not
-          // have landed here — proving the keyless guard, not coincidence.
-          { key: 'on', weight: 1 },
-          { key: 'off', weight: 99 },
-        ],
-      },
+      rules: [{ id: 'r1', priority: 1, conditionGroups: [], serve: thinRollout() }],
+      fallthrough: { type: 'Fixed', variation: 'off' },
     });
 
+    for (let i = 0; i < 5; i++) {
+      const result = evaluate(flag, {}, deps);
+      expect(result.variationKey).toBe('off');
+      expect(result.reason).toBe('Fallthrough');
+    }
+  });
+
+  it('serves the fallthrough variation when the fallthrough rollout cannot bucket (#4236)', () => {
+    const flag = makeFlag({ fallthrough: { ...thinRollout(), variation: 'off' } });
+    const result = evaluate(flag, {}, deps);
+    expect(result.variationKey).toBe('off');
+    expect(result.reason).toBe('Fallthrough');
+  });
+
+  it('custom bucketBy missing with userId present falls through (#4236)', () => {
+    const flag = makeFlag({
+      rules: [{ id: 'r1', priority: 1, conditionGroups: [], serve: thinRollout('anonymous_id') }],
+      fallthrough: { type: 'Fixed', variation: 'off' },
+    });
+    const result = evaluate(flag, { user_id: 'u1' }, deps);
+    expect(result.variationKey).toBe('off');
+    expect(result.reason).toBe('Fallthrough');
+  });
+
+  it('continues to the next rule when a keyless rollout rule is skipped (#4236)', () => {
+    const flag = makeFlag({
+      rules: [
+        { id: 'r1', priority: 1, conditionGroups: [], serve: thinRollout() },
+        { id: 'r2', priority: 2, conditionGroups: [], serve: { type: 'Fixed', variation: 'on' } },
+      ],
+      fallthrough: { type: 'Fixed', variation: 'off' },
+    });
     const result = evaluate(flag, {}, deps);
     expect(result.variationKey).toBe('on');
-    expect(result.value).toBe(true);
+    expect(result.reason).toBe('RuleMatch');
+    expect(result.ruleId).toBe('r2');
+  });
 
-    // Deterministic: repeated keyless evals never re-bucket.
-    for (let i = 0; i < 20; i++) {
-      expect(evaluate(flag, {}, deps).variationKey).toBe('on');
-    }
+  it('reports each skipped serve to onUnbucketable with ids only (#4236)', () => {
+    const seen: unknown[] = [];
+    const flag = makeFlag({
+      rules: [{ id: 'r1', priority: 1, conditionGroups: [], serve: thinRollout('anonymous_id') }],
+      fallthrough: { ...thinRollout(), variation: 'off' },
+    });
+    evaluate(flag, {}, { ...deps, onUnbucketable: (i) => seen.push(i) });
+    expect(seen).toEqual([
+      { flagKey: 'test-flag', ruleId: 'r1', bucketBy: 'anonymous_id' },
+      { flagKey: 'test-flag', ruleId: null, bucketBy: 'userId' },
+    ]);
   });
 
   it('serves the default variation when a rollout serve has no variations (#1469)', () => {
@@ -954,5 +992,102 @@ describe('evaluate', () => {
     const result = evaluate(flag, { plan: 'pro' }, { md5 });
     expect(result.reason).toBe('Fallthrough');
     expect(result.value).toBe(true);
+  });
+});
+
+// --- rollout bucket value spelling and unknown served variations (#4236) ---
+
+describe('rollout bucket value spelling (#4236)', () => {
+  const cases: Array<[number, string]> = [
+    [1.0, '1'],
+    [1.5, '1.5'],
+    [0.1, '0.1'],
+    [0.30000000000000004, '0.30000000000000004'],
+    [-0.0, '0'],
+    [100.25, '100.25'],
+    [1e21, '1e+21'],
+    [1.5e21, '1.5e+21'],
+    [1e20, '100000000000000000000'],
+    [1e-7, '1e-7'],
+    [0.000001, '0.000001'],
+    [2.5e-7, '2.5e-7'],
+    [123456.789, '123456.789'],
+    [-42, '-42'],
+  ];
+  for (const [n, spelled] of cases) {
+    it(`hashes ${Object.is(n, -0) ? '-0' : n} as "${spelled}"`, async () => {
+      const { resolveServe } = await import('../src/core/evaluator.js');
+      const seen: string[] = [];
+      const spyMd5 = (input: string) => {
+        seen.push(input);
+        return md5(input);
+      };
+      resolveServe(
+        {
+          type: 'Rollout',
+          bucketBy: 'id',
+          salt: 's',
+          variations: [{ key: 'a', weight: 100 }],
+        } as never,
+        { id: n } as EvaluationContext,
+        spyMd5,
+      );
+      expect(seen).toEqual([`s:${spelled}`]);
+    });
+  }
+});
+
+describe('served variation that does not exist (#4236)', () => {
+  const deps = { md5, getSegment: () => undefined };
+  it('is Error for a rule serve, with the served key and no value', () => {
+    const flag = makeFlag({
+      rules: [
+        { id: 'r', priority: 0, conditionGroups: [], serve: { type: 'Fixed', variation: 'nope' } },
+      ],
+    });
+    const r = evaluate(flag, { user_id: '1' }, deps);
+    expect(r.reason).toBe('Error');
+    expect(r.variationKey).toBe('nope');
+    expect(r.value).toBeNull();
+    expect(r.ruleId).toBeUndefined();
+  });
+  it('is Error for a fallthrough serve', () => {
+    const flag = makeFlag({ fallthrough: { type: 'Fixed', variation: 'nope' } });
+    const r = evaluate(flag, { user_id: '1' }, deps);
+    expect(r.reason).toBe('Error');
+    expect(r.variationKey).toBe('nope');
+  });
+});
+
+describe('off variation that does not exist (#4236)', () => {
+  const deps = { md5, getSegment: () => undefined };
+  it('is Error for a disabled flag, with the off key and no value', () => {
+    const flag = makeFlag({ enabled: false, offVariation: 'zzz' });
+    const r = evaluate(flag, { user_id: '1' }, deps);
+    expect(r.reason).toBe('Error');
+    expect(r.variationKey).toBe('zzz');
+    expect(r.value).toBeNull();
+  });
+  it('is Error, not PrerequisiteFailed, when the failed-prerequisite off variation is undefined', () => {
+    const main = makeFlag({
+      key: 'main',
+      offVariation: 'zzz',
+      prerequisites: [{ prerequisiteFlagKey: 'p', expectedVariationKey: 'on' }],
+    });
+    const parent = makeFlag({ key: 'p', enabled: false });
+    const r = evaluate(main, { user_id: '1' }, deps, { p: parent });
+    expect(r.reason).toBe('Error');
+    expect(r.variationKey).toBe('zzz');
+    expect(r.value).toBeNull();
+  });
+  it('a dependent of a flag with an undefined off variation reports Error', () => {
+    const parent = makeFlag({ key: 'p', enabled: false, offVariation: 'zzz' });
+    const main = makeFlag({
+      key: 'main',
+      prerequisites: [{ prerequisiteFlagKey: 'p', expectedVariationKey: 'on' }],
+    });
+    const r = evaluate(main, { user_id: '1' }, deps, { p: parent });
+    expect(r.reason).toBe('Error');
+    expect(r.variationKey).toBe('off');
   });
 });

@@ -701,7 +701,7 @@ function resolveServe(
   serve: ServeConfigDto,
   context: EvaluationContext,
   md5: (input: string) => Uint8Array,
-): string {
+): string | null {
   if (serve.type === 'Fixed') {
     return serve.variation ?? '';
   }
@@ -720,17 +720,12 @@ function resolveServe(
     return serve.variation ?? '';
   }
 
-  // Keyless user contexts can't be bucketed. Rather than hashing the empty
-  // value into an arbitrary salt-dependent bucket, serve the control (first)
-  // variation deterministically. The engine assigns a random GUID per eval
-  // (spreading anonymous users over HTTP); local SDK eval is deterministic, so
-  // parity is guaranteed only for keyed contexts (#1457).
-  if (
-    bucketValueStr === '' &&
-    (bucketBy === 'userId' || bucketBy === 'user_id') &&
-    variations.length > 0
-  ) {
-    return variations[0]!.key;
+  // A context with no value for the bucket-by attribute (missing, null or "")
+  // can't be bucketed. Hashing "" would pin every such context to one
+  // salt-dependent bucket, so signal the caller to skip this serve instead
+  // (#4236). Whitespace, "0" and false are real values and bucket normally.
+  if (bucketValueStr === '') {
+    return null;
   }
 
   const bucket = computeBucket(serve.salt ?? '', bucketValueStr, md5);
@@ -751,6 +746,8 @@ function resolveServe(
 export interface EvaluatorDeps {
   md5: (input: string) => Uint8Array;
   getSegment?: (key: string) => SegmentDto | undefined;
+  /** Told when a rollout serve is skipped because the context can't be bucketed. Absent => silent. */
+  onUnbucketable?: (info: { flagKey: string; ruleId: string | null; bucketBy: string }) => void;
 }
 
 /**
@@ -790,6 +787,29 @@ export function evaluateWithSharedMemo(
   return evaluateInternal(flag, context, deps, allFlags, 0, memo);
 }
 
+/**
+ * Serve `variationKey` from `flag` with `reason`. A key that names no variation is
+ * malformed config: report Error (value null, the key kept), matching the engine's
+ * ServeVariation — applied to the off variation too (#4236).
+ */
+function serveOff(
+  flag: FlagDto,
+  reason: EvaluationDetail['reason'],
+  prerequisiteKey?: string,
+): EvaluationDetail {
+  const variation = flag.variations.find((v) => v.key === flag.offVariation);
+  if (!variation) {
+    return { value: null, variationKey: flag.offVariation, reason: 'Error' };
+  }
+  const detail: EvaluationDetail = {
+    value: variation.value ?? null,
+    variationKey: flag.offVariation,
+    reason,
+  };
+  if (prerequisiteKey !== undefined) detail.prerequisiteKey = prerequisiteKey;
+  return detail;
+}
+
 function evaluateInternal(
   flag: FlagDto,
   context: EvaluationContext,
@@ -801,24 +821,12 @@ function evaluateInternal(
   // Guard: prevent runaway recursion (shouldn't happen with cycle detection at
   // write time, but depth-limit as a safety net).
   if (depth > MAX_PREREQUISITE_DEPTH) {
-    const offVariation = flag.variations.find((v) => v.key === flag.offVariation);
-    return {
-      value: offVariation?.value ?? null,
-      variationKey: flag.offVariation,
-      reason: 'Error',
-    };
+    return serveOff(flag, 'Error');
   }
 
   // Step 1: Check if flag is disabled
   if (!flag.enabled) {
-    const variation = flag.variations.find(
-      (v) => v.key === flag.offVariation,
-    );
-    return {
-      value: variation?.value ?? null,
-      variationKey: flag.offVariation,
-      reason: 'FlagDisabled',
-    };
+    return serveOff(flag, 'FlagDisabled');
   }
 
   // Step 2: Resolve prerequisites
@@ -831,13 +839,7 @@ function evaluateInternal(
 
       if (!prereqFlag) {
         // Missing flag: fail safely
-        const offVariation = flag.variations.find((v) => v.key === flag.offVariation);
-        const result: EvaluationDetail = {
-          value: offVariation?.value ?? null,
-          variationKey: flag.offVariation,
-          reason: 'PrerequisiteFailed',
-          prerequisiteKey: prereq.prerequisiteFlagKey,
-        };
+        const result = serveOff(flag, 'PrerequisiteFailed', prereq.prerequisiteFlagKey);
         memo.set(flag.key, result);
         return result;
       }
@@ -848,25 +850,14 @@ function evaluateInternal(
 
     // Bubble up errors from recursive evaluation
     if (prereqResult.reason === 'Error') {
-      const offVariation = flag.variations.find((v) => v.key === flag.offVariation);
-      const result: EvaluationDetail = {
-        value: offVariation?.value ?? null,
-        variationKey: flag.offVariation,
-        reason: 'Error',
-      };
+      const result = serveOff(flag, 'Error');
       memo.set(flag.key, result);
       return result;
     }
 
     // Check that the prerequisite served the expected variation
     if (prereqResult.variationKey !== prereq.expectedVariationKey) {
-      const offVariation = flag.variations.find((v) => v.key === flag.offVariation);
-      const result: EvaluationDetail = {
-        value: offVariation?.value ?? null,
-        variationKey: flag.offVariation,
-        reason: 'PrerequisiteFailed',
-        prerequisiteKey: prereq.prerequisiteFlagKey,
-      };
+      const result = serveOff(flag, 'PrerequisiteFailed', prereq.prerequisiteFlagKey);
       memo.set(flag.key, result);
       return result;
     }
@@ -903,10 +894,26 @@ function evaluateInternal(
     }
 
     if (conditionsMatch) {
-      const variationKey = resolveServe(rule.serve, context, deps.md5);
+      const resolved = resolveServe(rule.serve, context, deps.md5);
+      if (resolved === null) {
+        deps.onUnbucketable?.({
+          flagKey: flag.key,
+          ruleId: rule.id,
+          bucketBy: rule.serve.bucketBy ?? 'userId',
+        });
+        continue;
+      }
+      const variationKey = resolved;
       const variation = flag.variations.find((v) => v.key === variationKey);
+      if (!variation) {
+        // The served key names no variation: malformed config. Report Error (no
+        // rule id) with the served key, like the engine's ServeVariation (#4236).
+        const errorResult: EvaluationDetail = { value: null, variationKey, reason: 'Error' };
+        memo.set(flag.key, errorResult);
+        return errorResult;
+      }
       const result: EvaluationDetail = {
-        value: variation?.value ?? null,
+        value: variation.value ?? null,
         variationKey,
         reason: 'RuleMatch',
         ruleId: rule.id,
@@ -917,10 +924,23 @@ function evaluateInternal(
   }
 
   // Step 4: No rules matched, use fallthrough
-  const variationKey = resolveServe(flag.fallthrough, context, deps.md5);
+  let variationKey = resolveServe(flag.fallthrough, context, deps.md5);
+  if (variationKey === null) {
+    deps.onUnbucketable?.({
+      flagKey: flag.key,
+      ruleId: null,
+      bucketBy: flag.fallthrough.bucketBy ?? 'userId',
+    });
+    variationKey = flag.fallthrough.variation ?? '';
+  }
   const variation = flag.variations.find((v) => v.key === variationKey);
+  if (!variation) {
+    const errorResult: EvaluationDetail = { value: null, variationKey, reason: 'Error' };
+    memo.set(flag.key, errorResult);
+    return errorResult;
+  }
   const result: EvaluationDetail = {
-    value: variation?.value ?? null,
+    value: variation.value ?? null,
     variationKey,
     reason: 'Fallthrough',
   };
