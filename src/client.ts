@@ -268,7 +268,8 @@ export class FeatureflipClient {
 
   /**
    * Current number of live shared cores in the factory cache. Diagnostic only.
-   * @internal
+   * Not part of the supported API, but deliberately untagged: the declaration
+   * rollup strips `@internal` members, and these shipped in the types before.
    */
   static get debugLiveCoreCount(): number {
     return liveCores.size;
@@ -277,7 +278,8 @@ export class FeatureflipClient {
   /**
    * Returns the shared core's current refcount for the given SDK key, or 0 if
    * no core is cached for that key. Diagnostic only.
-   * @internal
+   * Not part of the supported API, but deliberately untagged: the declaration
+   * rollup strips `@internal` members, and these shipped in the types before.
    */
   static debugRefCount(sdkKey: string): number {
     return liveCores.get(sdkKey)?.debugRefCount ?? 0;
@@ -288,7 +290,8 @@ export class FeatureflipClient {
    * each currently-cached core. Handles that callers still hold will be
    * invalidated (their subsequent operations still work on the core's
    * in-memory state but background tasks are stopped).
-   * @internal
+   * Not part of the supported API, but deliberately untagged: the declaration
+   * rollup strips `@internal` members, and these shipped in the types before.
    */
   static async resetForTesting(): Promise<void> {
     const cores = [...liveCores.values()];

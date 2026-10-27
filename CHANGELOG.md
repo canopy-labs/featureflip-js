@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.17.1 — 2026-10-27
+
+### Changed
+
+- The type declarations now ship as one rolled-up `.d.ts` per entry point instead of a file per source module. The exported types are unchanged. `types` now names `dist/node.d.ts`; the old `dist/index.node.d.ts` path is gone, which only matters to a build that referenced the file directly. (#4346)
+
 ## 2.17.0 — 2026-10-27
 
 ### Changed

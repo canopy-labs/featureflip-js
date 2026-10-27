@@ -3,7 +3,7 @@ import { resolveConfig } from '../config.js';
 import { FlagStore } from './store.js';
 import { resolveDetail } from './resolve-detail.js';
 import { warnUnbucketable } from './unbucketable.js';
-import type { ExpectedValueType } from './resolve-detail.js';
+import type { ExpectedValueType, ResolveDeps } from './resolve-detail.js';
 import { EventProcessor, EventSendError } from './events.js';
 import type {
   EvaluationContext,
@@ -105,6 +105,8 @@ export class SharedFeatureflipCore {
   private readonly inspectors: EvaluationInspector[];
   /** `featureflip-js/<version>` plus wrapper tokens, built once (#4144). */
   private readonly identity: string;
+  /** What every `variationDetail` hands `resolveDetail`, built once rather than per read. */
+  private readonly resolveDeps: ResolveDeps;
   private readonly updateListeners = new Set<FlagUpdateListener>();
   private initialized = false;
   private initPromise: Promise<void> | null = null;
@@ -131,6 +133,12 @@ export class SharedFeatureflipCore {
     this.config = resolveConfig(config);
     this.store = new FlagStore();
     this.platform = platform;
+    // Arrows, not bound methods: the evaluator calls `md5` detached.
+    this.resolveDeps = {
+      md5: (input) => this.platform.md5(input),
+      getSegment: (segKey) => this.store.getSegment(segKey),
+      onUnbucketable: (i) => warnUnbucketable(i),
+    };
     // Also from the RAW config, for the same reason as inspectors below: wrappers
     // identify the caller and must not trip the config-equality warning.
     this.identity = buildIdentity(config.wrappers);
@@ -292,11 +300,7 @@ export class SharedFeatureflipCore {
     // A thunk, so resolveDetail builds it inside its guard: a store that throws
     // here degrades the read to `Error` instead of escaping the variation call.
     const allFlags = () => Object.fromEntries(this.store.getAllFlags().map((f) => [f.key, f]));
-    const detail = resolveDetail(flag, context, defaultValue, {
-      md5: (input) => this.platform.md5(input),
-      getSegment: (segKey) => this.store.getSegment(segKey),
-      onUnbucketable: (i) => warnUnbucketable(i),
-    }, allFlags, expected);
+    const detail = resolveDetail(flag, context, defaultValue, this.resolveDeps, allFlags, expected);
 
     this.events.enqueue(buildEvaluationEvent(key, context, detail));
     this.notifyInspectors(key, context, detail.value, {

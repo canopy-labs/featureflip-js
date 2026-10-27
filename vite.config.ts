@@ -16,7 +16,12 @@ export default defineConfig({
   },
   plugins: [
     dts({
-      rollupTypes: true,
+      // bundleTypes rolls the declarations up with api-extractor. unplugin-dts
+      // hands it the workspace's `typescript` as its compiler, but that is TS7,
+      // which ships no lib .d.ts files, so no global resolves ("Unable to follow
+      // symbol for Promise"). Unsetting the folder makes api-extractor fall back
+      // to the TypeScript it bundles.
+      bundleTypes: { invokeOptions: { typescriptCompilerFolder: undefined } },
       outDir: 'dist',
     }),
   ],
