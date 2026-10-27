@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.17.0 — 2026-10-27
+
+### Changed
+
+- Republished in lockstep with `@featureflip/edge` 2.17.0. This package has no user-visible changes of its own; an internal hook the edge SDK uses to log evaluation errors was added to the shared core. Recorded here because the npm release tag publishes all five JavaScript packages at a single version. (#4210)
+
 ## 2.16.0 — 2026-10-26
 
 ### Added

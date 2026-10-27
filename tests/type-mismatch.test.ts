@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { FeatureflipClient } from '../src/client.js';
+import { FlagStore } from '../src/core/store.js';
 import type { Platform } from '../src/platform/types.js';
 import type {
   GetFlagsResponse,
@@ -167,5 +168,26 @@ describe('type-mismatched reads', () => {
       const client = await makeClient();
       expect(client.jsonVariation('str-flag', {}, { a: 1 })).toBe('42');
     });
+  });
+});
+
+// #4188 moved the prerequisite map into resolveDetail's guard: a store that
+// throws while building it degrades the read to Error instead of escaping it.
+describe('a store that throws while listing flags', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await FeatureflipClient.resetForTesting();
+  });
+
+  it("serves the caller's default with Error, and does not throw", async () => {
+    const client = await makeClient();
+    vi.spyOn(FlagStore.prototype, 'getAllFlags').mockImplementation(() => {
+      throw new Error('store broke');
+    });
+    expect(client.variationDetail('bool-flag', { userId: 'bob' }, true)).toMatchObject({
+      value: true,
+      reason: 'Error',
+    });
+    expect(client.boolVariation('bool-flag', { userId: 'bob' }, true)).toBe(true);
   });
 });

@@ -24,7 +24,7 @@ export interface ResolveDeps {
    * reason `Error`. Optional: the JS core has never surfaced these and does not
    * pass it; the edge SDK logs them.
    */
-  onError?(err: unknown): void;
+  onError?(err: unknown, flagKey: string): void;
   /** Told when a rollout serve is skipped because the context can't be bucketed (#4236). */
   onUnbucketable?(info: { flagKey: string; ruleId: string | null; bucketBy: string }): void;
 }
@@ -65,17 +65,12 @@ export function resolveDetail<T>(
 
   try {
     const flags = typeof allFlags === 'function' ? allFlags() : allFlags;
-    const evaluatorDeps = {
-      md5: (input: string) => deps.md5(input),
-      getSegment: (segKey: string) => deps.getSegment(segKey),
-      onUnbucketable: deps.onUnbucketable
-        ? (info: { flagKey: string; ruleId: string | null; bucketBy: string }) =>
-            deps.onUnbucketable!(info)
-        : undefined,
-    };
+    // Passed straight through, not re-wrapped: this runs on every variation
+    // call. The evaluator calls `md5` detached, so callers pass functions that
+    // do not use `this` (both do).
     const result = memo
-      ? evaluateWithSharedMemo(flag, context, evaluatorDeps, flags, memo)
-      : evaluate(flag, context, evaluatorDeps, flags);
+      ? evaluateWithSharedMemo(flag, context, deps, flags, memo)
+      : evaluate(flag, context, deps, flags);
 
     // Malformed config: the evaluator selected a variation key the flag does
     // not define (e.g. a fallthrough/rule naming a since-deleted variation).
@@ -112,7 +107,7 @@ export function resolveDetail<T>(
       prerequisiteKey: result.prerequisiteKey,
     };
   } catch (err) {
-    deps.onError?.(err);
+    deps.onError?.(err, flag.key);
     return { value: defaultValue, reason: 'Error' };
   }
 }
