@@ -5,8 +5,9 @@ import { vi } from 'vitest';
 import { FeatureflipClient } from '../src/client.js';
 import type { Platform } from '../src/platform/types.js';
 
-// The eventPayloadVectors class locks what identify() and track() actually put on
-// the wire: {type, flagKey, userId?, variation?, timestamp, metadata?}.
+// The eventPayloadVectors class locks what identify(), track() and a flag read
+// actually put on the wire: {type, flagKey, userId?, variation?, timestamp,
+// metadata?, reason?, ruleId?, prerequisiteKey?}.
 //
 // That had no executable spec at all, which is the direct cause of #2359 — a
 // three-way payload divergence across six SDKs (js/node/python forwarded the
@@ -22,9 +23,13 @@ import type { Platform } from '../src/platform/types.js';
 interface EventVector {
   id: string;
   description: string;
-  kind: 'identify' | 'track';
+  kind: 'identify' | 'track' | 'evaluation';
   requires?: string[];
   context: Record<string, unknown>;
+  // evaluation only: the snapshot the SDK holds, and the flag the read names.
+  flags?: unknown[];
+  segments?: unknown[];
+  flagKey?: string;
   eventKey?: string;
   metadata?: Record<string, unknown>;
   expect: Record<string, unknown>;
@@ -51,10 +56,13 @@ function md5(input: string): Uint8Array {
   return createHash('md5').update(input, 'utf8').digest();
 }
 
-function platformCapturing(): Platform & { fetchMock: ReturnType<typeof vi.fn> } {
+function platformCapturing(
+  flags: unknown[] = [],
+  segments: unknown[] = [],
+): Platform & { fetchMock: ReturnType<typeof vi.fn> } {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
-    json: async () => ({ environment: 'test', version: 1, flags: [], segments: [] }),
+    json: async () => ({ environment: 'test', version: 1, flags, segments }),
   });
   return {
     md5,
@@ -100,7 +108,7 @@ describe('golden: event payload vectors', () => {
     executed++;
 
     it(`${v.id}: ${v.description}`, async () => {
-      const platform = platformCapturing();
+      const platform = platformCapturing(v.flags, v.segments);
       const client = FeatureflipClient.get(
         { sdkKey: `events-${v.id}`, baseUrl: 'http://localhost:0', streaming: false },
         platform,
@@ -109,7 +117,9 @@ describe('golden: event payload vectors', () => {
       try {
         await client.waitForInitialization();
 
-        if (v.kind === 'identify') {
+        if (v.kind === 'evaluation') {
+          client.boolVariation(v.flagKey!, v.context, false);
+        } else if (v.kind === 'identify') {
           client.identify(v.context);
         } else if ('metadata' in v) {
           client.track(v.eventKey!, v.context, v.metadata);
@@ -144,6 +154,6 @@ describe('golden: event payload vectors', () => {
 
   // A runner that silently skips everything is worse than no runner at all.
   it('executed the expected number of vectors', () => {
-    expect(executed).toBeGreaterThanOrEqual(13);
+    expect(executed).toBeGreaterThanOrEqual(19);
   });
 });

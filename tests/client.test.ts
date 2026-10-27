@@ -468,6 +468,55 @@ describe('FeatureflipClient', () => {
       // JS SDK must not send `prerequisiteKey: null` for a non-prereq event.
       expect('prerequisiteKey' in evalEvents[0]).toBe(false);
     });
+
+    // The golden eventPayloadVectors carry no Error vector, because SDKs differ
+    // on whether a type-mismatched read keeps its variation. What every SDK
+    // must agree on is pinned here instead: the reason is `error`, and the rule
+    // that selected the variation is NOT reported, since it did not serve the
+    // read (#4268).
+    it('sends reason error and no ruleId when a rule-matched read type-mismatches', async () => {
+      const platform = createMockPlatform();
+      platform.fetchMock.mockResolvedValue({
+        ok: true,
+        json: async (): Promise<GetFlagsResponse> => ({
+          environment: 'test',
+          version: 1,
+          flags: [
+            {
+              key: 'str-flag',
+              version: 1,
+              type: 'String',
+              enabled: true,
+              variations: [{ key: 'a', value: 'text' }],
+              rules: [
+                {
+                  id: 'rule-1',
+                  priority: 0,
+                  conditionGroups: [],
+                  serve: { type: 'Fixed', variation: 'a' },
+                },
+              ],
+              fallthrough: { type: 'Fixed', variation: 'a' },
+              offVariation: 'a',
+            },
+          ],
+          segments: [],
+        }),
+      });
+
+      const client = FeatureflipClient.get(
+        { sdkKey: 'test-key', baseUrl: 'http://localhost:5000' },
+        platform,
+      );
+      await client.waitForInitialization();
+
+      expect(client.boolVariation('str-flag', { user_id: 'u1' }, false)).toBe(false);
+      await client.close();
+
+      const [event] = eventsBodies(platform.fetchMock).filter((e) => e.type === 'Evaluation');
+      expect(event.reason).toBe('error');
+      expect('ruleId' in event).toBe(false);
+    });
   });
 
   describe('flush', () => {

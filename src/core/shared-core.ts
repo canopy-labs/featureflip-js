@@ -14,6 +14,7 @@ import type {
   FlagDto,
   FlagUpdateListener,
   GetFlagsResponse,
+  SdkEventDto,
   StreamFlagUpdatedEvent,
 } from './types.js';
 import type { EventSourceLike, Platform } from '../platform/types.js';
@@ -40,6 +41,45 @@ export function resolveEventUserId(
 ): string | undefined {
   const raw = context.user_id ?? context.userId;
   return raw != null ? String(raw) : undefined;
+}
+
+/**
+ * The wire spelling of each reason on an `Evaluation` event: the server
+ * evaluator's kebab-case category, which every SDK sends so the analytics
+ * source reads the same whichever SDK reported it (#4268). The PascalCase
+ * names stay the public `EvaluationDetail` API; only the event is translated.
+ */
+const WIRE_REASONS: Record<EvaluationReason, string> = {
+  RuleMatch: 'rule-match',
+  Fallthrough: 'fallthrough',
+  FlagDisabled: 'flag-disabled',
+  FlagNotFound: 'flag-not-found',
+  PrerequisiteFailed: 'prerequisite-failed',
+  Error: 'error',
+};
+
+/**
+ * The `Evaluation` event for one read. Shared with the edge SDK so both put
+ * the same fields on the wire. Absent optionals are undefined, which
+ * JSON.stringify drops, so they are omitted rather than sent as null. `ruleId`
+ * rides only on a rule match: an `Error` read can still carry the rule that
+ * selected a malformed variation, and that rule did not serve the traffic.
+ */
+export function buildEvaluationEvent(
+  flagKey: string,
+  context: EvaluationContext,
+  detail: EvaluationDetail,
+): SdkEventDto {
+  return {
+    type: 'Evaluation',
+    flagKey,
+    userId: resolveEventUserId(context),
+    variation: detail.variationKey,
+    timestamp: new Date().toISOString(),
+    prerequisiteKey: detail.prerequisiteKey,
+    reason: WIRE_REASONS[detail.reason],
+    ruleId: detail.reason === 'RuleMatch' ? detail.ruleId : undefined,
+  };
 }
 
 export type { ExpectedValueType } from './resolve-detail.js';
@@ -258,7 +298,7 @@ export class SharedFeatureflipCore {
       onUnbucketable: (i) => warnUnbucketable(i),
     }, allFlags, expected);
 
-    this.recordEvaluation(key, context, detail.variationKey, detail.prerequisiteKey);
+    this.events.enqueue(buildEvaluationEvent(key, context, detail));
     this.notifyInspectors(key, context, detail.value, {
       variationKey: detail.variationKey,
       reason: detail.reason,
@@ -696,27 +736,6 @@ export class SharedFeatureflipCore {
         console.warn('[featureflip] evaluation inspector threw:', err);
       }
     }
-  }
-
-  private recordEvaluation(
-    key: string,
-    context: EvaluationContext,
-    variationKey: string | undefined,
-    prerequisiteKey?: string,
-  ): void {
-    const userId = resolveEventUserId(context);
-
-    // `prerequisiteKey` is undefined except on the PrerequisiteFailed path;
-    // JSON.stringify drops undefined fields, so it's absent (not null) on the
-    // wire — matching the backend's WhenWritingNull serialization.
-    this.events.enqueue({
-      type: 'Evaluation',
-      flagKey: key,
-      userId,
-      variation: variationKey,
-      timestamp: new Date().toISOString(),
-      prerequisiteKey,
-    });
   }
 
   private headers(): Record<string, string> {

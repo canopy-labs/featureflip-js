@@ -163,6 +163,11 @@ export interface SdkEventDto {
   // can attribute the gating prerequisite. Mirrors the backend `SdkEventDto`
   // (`PrerequisiteKey`); omitted (not null) on the wire when absent.
   prerequisiteKey?: string;
+  // Set on `Evaluation` events: the kebab-case reason (`rule-match`,
+  // `fallthrough`, ...) and, on a rule match, the rule's id, so analytics can
+  // say which part of the targeting served the read (#4268).
+  reason?: string;
+  ruleId?: string;
 }
 
 export interface RecordEventsRequest {
