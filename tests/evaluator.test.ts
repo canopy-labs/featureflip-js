@@ -1091,3 +1091,35 @@ describe('off variation that does not exist (#4236)', () => {
     expect(r.variationKey).toBe('off');
   });
 });
+
+// --- user identifier resolution (#4518) ---
+
+describe('user identifier resolution', () => {
+  const equals = (attribute: string, value: string) =>
+    makeCondition({ attribute, operator: 'Equals', values: [value] });
+
+  it('both spellings resolve to user_id', () => {
+    const ctx = { user_id: 'a', userId: 'b' };
+    expect(evaluateCondition(equals('userId', 'a'), ctx)).toBe(true);
+    expect(evaluateCondition(equals('userId', 'b'), ctx)).toBe(false);
+    expect(evaluateCondition(equals('user_id', 'a'), ctx)).toBe(true);
+  });
+
+  it('a null user_id falls through to userId', () => {
+    const ctx = { user_id: null, userId: 'b' } as unknown as EvaluationContext;
+    expect(evaluateCondition(equals('user_id', 'b'), ctx)).toBe(true);
+    expect(evaluateCondition(equals('userId', 'b'), ctx)).toBe(true);
+  });
+
+  it('an empty user_id is a value, not absent', () => {
+    const ctx = { user_id: '', userId: 'b' };
+    expect(evaluateCondition(equals('userId', 'b'), ctx)).toBe(false);
+    expect(evaluateCondition(equals('userId', ''), ctx)).toBe(true);
+  });
+
+  it('any other casing is an ordinary attribute', () => {
+    const ctx = { user_id: 'a', UserId: 'x' };
+    expect(evaluateCondition(equals('UserId', 'x'), ctx)).toBe(true);
+    expect(evaluateCondition(equals('UserId', 'a'), ctx)).toBe(false);
+  });
+});

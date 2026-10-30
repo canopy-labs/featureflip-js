@@ -31,8 +31,8 @@ import { buildIdentity } from './identity.js';
 
 /**
  * Resolve the built-in user id for an analytics event from either the
- * canonical `user_id` field or its `userId` camelCase alias — mirroring the
- * two-way alias the evaluator applies for rollout bucketing. Without this the
+ * canonical `user_id` field or its `userId` camelCase alias — the same
+ * resolution rule the evaluator applies (`user_id` first, then `userId`). Without this the
  * event's `userId` is silently null whenever a caller passes a `userId`-keyed
  * context (a documented-valid shape), leaving analytics unattributed.
  */

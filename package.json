@@ -1,6 +1,6 @@
 {
   "name": "@featureflip/js",
-  "version": "2.17.2",
+  "version": "2.18.0",
   "description": "JavaScript/TypeScript SDK for Featureflip",
   "keywords": [
     "feature-flags",

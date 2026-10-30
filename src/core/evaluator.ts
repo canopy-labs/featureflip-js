@@ -43,12 +43,17 @@ function getContextAttribute(
   context: EvaluationContext,
   attribute: string,
 ): unknown {
-  const value = context[attribute];
-  if (value !== undefined) return value;
-  // Alias "userId" <-> "user_id" for the built-in user identifier
-  if (attribute === 'userId') return context['user_id'];
-  if (attribute === 'user_id') return context['userId'];
-  return undefined;
+  // The built-in user identifier has two spellings; `user_id` is canonical and
+  // wins when non-null, then `userId`. An empty string is a value. Any other
+  // casing is an ordinary attribute. Mirrors the engine's WireContext mapper (#4518).
+  if (attribute === 'user_id' || attribute === 'userId') {
+    const canonical = context['user_id'];
+    if (canonical != null) return canonical;
+    const alias = context['userId'];
+    if (alias != null) return alias;
+    return canonical !== undefined ? canonical : alias;
+  }
+  return context[attribute];
 }
 
 /**
@@ -697,6 +702,19 @@ function evaluateConditionGroups(
   );
 }
 
+/**
+ * A JSON array or object (empty or not), or a Map or Set, has no spelling every
+ * runtime shares, so a rollout can't bucket on it: it is treated like a missing
+ * value (#4572). Other objects (a Date, a class with its own toString) keep
+ * their String() spelling, as the other SDKs keep theirs.
+ */
+function isNonScalar(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  if (Array.isArray(value) || value instanceof Map || value instanceof Set) return true;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
 function resolveServe(
   serve: ServeConfigDto,
   context: EvaluationContext,
@@ -707,9 +725,10 @@ function resolveServe(
   }
 
   // Rollout
-  const bucketBy = serve.bucketBy ?? 'userId';
+  const bucketBy = serve.bucketBy ?? 'user_id';
   const bucketValue = getContextAttribute(context, bucketBy);
-  const bucketValueStr = bucketValue != null ? String(bucketValue) : '';
+  const bucketValueStr =
+    bucketValue == null || isNonScalar(bucketValue) ? '' : String(bucketValue);
   const variations = serve.variations ?? [];
 
   // A Rollout serve can arrive with no weighted variations — env-level PercentageRollout
@@ -720,8 +739,8 @@ function resolveServe(
     return serve.variation ?? '';
   }
 
-  // A context with no value for the bucket-by attribute (missing, null or "")
-  // can't be bucketed. Hashing "" would pin every such context to one
+  // A context with no value for the bucket-by attribute (missing, null, "" or a
+  // non-scalar) can't be bucketed. Hashing "" would pin every such context to one
   // salt-dependent bucket, so signal the caller to skip this serve instead
   // (#4236). Whitespace, "0" and false are real values and bucket normally.
   if (bucketValueStr === '') {
@@ -899,7 +918,7 @@ function evaluateInternal(
         deps.onUnbucketable?.({
           flagKey: flag.key,
           ruleId: rule.id,
-          bucketBy: rule.serve.bucketBy ?? 'userId',
+          bucketBy: rule.serve.bucketBy ?? 'user_id',
         });
         continue;
       }
@@ -929,7 +948,7 @@ function evaluateInternal(
     deps.onUnbucketable?.({
       flagKey: flag.key,
       ruleId: null,
-      bucketBy: flag.fallthrough.bucketBy ?? 'userId',
+      bucketBy: flag.fallthrough.bucketBy ?? 'user_id',
     });
     variationKey = flag.fallthrough.variation ?? '';
   }

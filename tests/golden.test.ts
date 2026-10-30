@@ -26,7 +26,9 @@ const vectors = JSON.parse(
     flagKey: string;
     flags: unknown[];
     segments: Array<{ key: string; version: number; conditions: unknown[]; conditionLogic: string }>;
-    context: { userId: string; attributes: Record<string, unknown> };
+    context?: { userId: string; attributes: Record<string, unknown> };
+    wireContext?: Record<string, unknown>;
+    requires?: string[];
     expected: { variation: string; value: unknown; reason: { kind: string; ruleId?: string; prerequisiteKey?: string } };
   }>;
 };
@@ -185,8 +187,18 @@ describe('golden dateGrammarVectors', () => {
 
 // ─── Flag vectors ──────────────────────────────────────────────────────────────
 
+// js is a map-context SDK that matches identity case-sensitively, so it has both tokens.
+const SUPPORTED_CAPABILITIES = new Set(['mapContext', 'exactCaseIdentity']);
+
 describe('golden flagVectors', () => {
+  let executed = 0;
+  let skipped = 0;
   for (const v of vectors.flagVectors) {
+    if ((v.requires ?? []).some((t) => !SUPPORTED_CAPABILITIES.has(t))) {
+      skipped++;
+      continue;
+    }
+    executed++;
     it(v.id, () => {
       // Build allFlags map from the fixture's flag array
       const allFlags: Record<string, never> = {};
@@ -206,10 +218,10 @@ describe('golden flagVectors', () => {
       };
 
       // Merge userId + attributes into a flat EvaluationContext
-      const ctx: Record<string, unknown> = {
-        userId: v.context.userId,
-        ...v.context.attributes,
-      };
+      // A wireContext vector's map is passed verbatim, exactly as a caller would.
+      const ctx: Record<string, unknown> = v.wireContext
+        ? { ...v.wireContext }
+        : { userId: v.context!.userId, ...v.context!.attributes };
 
       const targetFlag = allFlags[v.flagKey];
       const r = evaluate(targetFlag, ctx, deps, allFlags);
@@ -229,4 +241,12 @@ describe('golden flagVectors', () => {
       expect(normalizeReason(r as { reason: string; ruleId?: string; prerequisiteKey?: string })).toEqual(v.expected.reason);
     });
   }
+
+  // js supports every capability token, so nothing may be skipped, and a runner that
+  // quietly iterated nothing would pass for the wrong reason.
+  it('executed every flag vector', () => {
+    expect(skipped).toBe(0);
+    expect(executed).toBe(vectors.flagVectors.length);
+    expect(executed).toBeGreaterThanOrEqual(71);
+  });
 });
