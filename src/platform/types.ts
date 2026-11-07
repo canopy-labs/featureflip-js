@@ -6,6 +6,8 @@ export interface EventSourceLike {
 
 export interface Platform {
   md5(input: string): Uint8Array;
+  /** Lowercase hex SHA-256 of the UTF-8 input. Node only; the browser leaves it unset. */
+  sha256Hex?(input: string): string;
   /**
    * May be asynchronous: the Node platform loads its ESM-only `eventsource`
    * dependency with a dynamic `import()`, which is what keeps the SDK's

@@ -40,6 +40,10 @@ export function createNodePlatform(): Platform {
       return createHash('md5').update(input, 'utf8').digest();
     },
 
+    sha256Hex(input: string): string {
+      return createHash('sha256').update(input, 'utf8').digest('hex');
+    },
+
     async createEventSource(url: string, headers: Record<string, string>) {
       const EventSourceLib = await loadEventSource();
       const es = new EventSourceLib(url, {

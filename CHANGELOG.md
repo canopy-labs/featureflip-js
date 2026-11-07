@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.19.0 — 2026-11-07
+
+### Added
+
+- The shared core gains the snapshot-store support used by `@featureflip/node` 2.19.0: an optional store read when the initial fetch fails, rewritten as the configuration changes. (#4652)
+
+### Fixed
+
+- With a snapshot store configured and nothing stored yet, a failed or timed-out initial fetch now logs a warning naming the cause (HTTP status, timeout or error), never the SDK key. It used to log nothing. (#5153)
+- The 'option ignored' warning about `maxSnapshotAgeSeconds` now appears only when the option was actually passed. (#5151)
+
 ## 2.18.0 — 2026-10-30
 
 ### Fixed

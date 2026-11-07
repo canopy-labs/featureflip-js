@@ -40,7 +40,8 @@ export default defineConfig({
     rolldownOptions: {
       // 'module' was here for the createRequire() that loaded eventsource; #2246
       // replaced that with a dynamic import(), so nothing imports it any more.
-      external: ['eventsource', 'crypto'],
+      // FileSnapshotStore imports node:fs / node:crypto; without this, the bundler stubs them as browser-externalized and the store breaks from dist.
+      external: ['eventsource', 'crypto', /^node:/],
     },
   },
   test: {

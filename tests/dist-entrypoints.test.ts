@@ -1,8 +1,9 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
 import { createRequire } from 'module';
-import { resolve } from 'path';
+import { tmpdir } from 'os';
+import { join, resolve } from 'path';
 
 // #2245: `dist/node.cjs` threw at module load in every published version, so
 // `require('@featureflip/js')` was dead on arrival while `import` worked fine.
@@ -36,6 +37,47 @@ beforeAll(() => {
 }, 180_000);
 
 describe('built entrypoints', () => {
+  it('keeps node: builtins external so FileSnapshotStore works from dist', async () => {
+    // Without `/^node:/` in vite's external list the bundler stubs node:fs /
+    // node:crypto for "browser compatibility" and the store is dead at runtime:
+    // put() warns and writes nothing, get() returns undefined. A real round trip
+    // through each built node entry catches that; a text match would not prove it.
+    type Store = { get(): Promise<string | undefined>; put(t: string): Promise<void> };
+    const cjs = nodeRequire(resolve(distDir, 'node.cjs')) as {
+      FileSnapshotStore: new (p: string) => Store;
+    };
+    const esm = (await import(resolve(distDir, 'node.mjs'))) as typeof cjs;
+    const dir = mkdtempSync(join(tmpdir(), 'ff-dist-snap-'));
+    try {
+      for (const [name, entry] of [['cjs', cjs], ['esm', esm]] as const) {
+        const file = join(dir, `${name}.json`);
+        const store = new entry.FileSnapshotStore(file);
+        await store.put(`{"from":"${name}"}`);
+        expect(await store.get()).toBe(`{"from":"${name}"}`);
+        expect(statSync(file).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the browser builds import no node: builtins, directly or through their chunks', () => {
+    // The browser entries share a client chunk with the node entries; a node:
+    // import landing in that chunk would break every browser bundler.
+    const seen = new Set<string>();
+    const visit = (file: string): void => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const text = readFileSync(resolve(distDir, file), 'utf8');
+      expect(text, file).not.toMatch(/["'`]node:[a-z_/]+["'`]/);
+      const relative = /(?:from\s*|require\(\s*|import\(\s*)["'`]\.\/([^"'`]+)["'`]/g;
+      for (const m of text.matchAll(relative)) visit(m[1]);
+    };
+    visit('browser.mjs');
+    visit('browser.cjs');
+    expect(seen.size).toBeGreaterThan(2);
+  });
+
   it('loads the CommonJS node build', () => {
     const entry = nodeRequire(resolve(distDir, 'node.cjs')) as NodeEntry;
 

@@ -70,4 +70,23 @@ describe('resolveConfig', () => {
       0,
     );
   });
+
+  it('defaults maxSnapshotAgeSeconds to 86400', () => {
+    expect(resolveConfig({ ...BASE }).maxSnapshotAgeSeconds).toBe(86_400);
+  });
+
+  it.each([0, -1, NaN, Infinity])(
+    'throws when maxSnapshotAgeSeconds is %s',
+    (value) => {
+      expect(() =>
+        resolveConfig({ ...BASE, maxSnapshotAgeSeconds: value }),
+      ).toThrow('maxSnapshotAgeSeconds must be a positive number');
+    },
+  );
+
+  it('keeps a custom positive maxSnapshotAgeSeconds', () => {
+    expect(
+      resolveConfig({ ...BASE, maxSnapshotAgeSeconds: 600 }).maxSnapshotAgeSeconds,
+    ).toBe(600);
+  });
 });

@@ -302,6 +302,130 @@ describe('FeatureflipClient.get (factory)', () => {
     warnSpy.mockRestore();
   });
 
+  describe('snapshot options on an existing key', () => {
+    const textStore = () => ({ get: async () => undefined, put: async () => {} });
+    const snapshotWarnings = (calls: unknown[][]) =>
+      calls.filter((c) => String(c[0]).includes('client for this SDK key already exists'));
+
+    async function withExisting(
+      first: Record<string, unknown>,
+      later: Record<string, unknown>,
+    ): Promise<unknown[][]> {
+      const platform = {
+        ...createMockPlatform(),
+        sha256Hex: (i: string) => createHash('sha256').update(i).digest('hex'),
+      };
+      const key = uniqueKey('snapwarn');
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const base = { sdkKey: key, baseUrl: 'http://localhost:5000', streaming: true };
+      const h1 = FeatureflipClient.get({ ...base, ...first }, platform);
+      await h1.waitForInitialization();
+      warnSpy.mockClear();
+      const h2 = FeatureflipClient.get({ ...base, ...later }, platform);
+      const calls = [...warnSpy.mock.calls];
+      await h1.close();
+      await h2.close();
+      warnSpy.mockRestore();
+      return calls;
+    }
+
+    it('warns once that a later snapshotStore is ignored', async () => {
+      const calls = await withExisting({}, { snapshotStore: textStore() });
+      expect(snapshotWarnings(calls)).toHaveLength(1);
+      expect(String(snapshotWarnings(calls)[0][0])).toContain('snapshotStore');
+      expect(calls).toHaveLength(1);
+    });
+
+    it('warns once that a different maxSnapshotAgeSeconds is ignored', async () => {
+      const calls = await withExisting({}, { maxSnapshotAgeSeconds: 60 });
+      expect(snapshotWarnings(calls)).toHaveLength(1);
+      expect(String(snapshotWarnings(calls)[0][0])).toContain('maxSnapshotAgeSeconds');
+      expect(calls).toHaveLength(1);
+    });
+
+    it('stays quiet when a later get() omits maxSnapshotAgeSeconds the first one set', async () => {
+      const calls = await withExisting({ maxSnapshotAgeSeconds: 60 }, {});
+      expect(calls).toEqual([]);
+    });
+
+    it('still warns when a later get() explicitly passes the default and the first set another', async () => {
+      const calls = await withExisting({ maxSnapshotAgeSeconds: 60 }, { maxSnapshotAgeSeconds: 86_400 });
+      expect(snapshotWarnings(calls)).toHaveLength(1);
+      expect(String(snapshotWarnings(calls)[0][0])).toContain('maxSnapshotAgeSeconds');
+      expect(calls).toHaveLength(1);
+    });
+
+    it('treats an explicit undefined maxSnapshotAgeSeconds as omitted', async () => {
+      const calls = await withExisting({ maxSnapshotAgeSeconds: 60 }, { maxSnapshotAgeSeconds: undefined });
+      expect(calls).toEqual([]);
+    });
+
+    it('stays quiet when the same store instance is passed again', async () => {
+      const store = textStore();
+      const calls = await withExisting({ snapshotStore: store }, { snapshotStore: store });
+      expect(calls).toEqual([]);
+    });
+  });
+
+  describe('initial fetch failure with a snapshot store', () => {
+    const emptyStore = () => ({ get: async () => undefined, put: async () => {} });
+
+    async function start(fetchImpl: () => Promise<unknown>, extra: Record<string, unknown> = {}) {
+      const platform = {
+        ...createMockPlatform(),
+        sha256Hex: (i: string) => createHash('sha256').update(i).digest('hex'),
+      };
+      platform.fetch = vi.fn(fetchImpl) as never;
+      const key = uniqueKey('initfail');
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const client = FeatureflipClient.get(
+        {
+          sdkKey: key,
+          baseUrl: 'http://localhost:5000',
+          streaming: false,
+          pollInterval: 600_000,
+          snapshotStore: emptyStore(),
+          ...extra,
+        },
+        platform,
+      );
+      await client.waitForInitialization();
+      const text = warnSpy.mock.calls.map((c) => c.map(String).join(' '));
+      await client.close();
+      warnSpy.mockRestore();
+      return { key, text };
+    }
+
+    it('logs the HTTP status when nothing is stored, never the key', async () => {
+      const { key, text } = await start(async () => ({ ok: false, status: 503 }));
+      expect(text.some((t) => t.includes('initial flag fetch failed (HTTP 503); no snapshot stored; serving defaults'))).toBe(true);
+      expect(text.join('\n')).not.toContain(key);
+    });
+
+    it('logs a thrown message when nothing is stored', async () => {
+      const { key, text } = await start(async () => {
+        throw new Error('connect ECONNREFUSED');
+      });
+      expect(text.some((t) => t.includes('(connect ECONNREFUSED); no snapshot stored; serving defaults'))).toBe(true);
+      expect(text.join('\n')).not.toContain(key);
+    });
+
+    it('logs the timeout when nothing is stored', async () => {
+      // A hung request that honors the abort signal, like a real fetch.
+      const hung = ((_url: unknown, init?: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        })) as unknown as () => Promise<unknown>;
+      const { text } = await start(hung, { initTimeout: 50 });
+      expect(text.some((t) => t.includes('timed out after 50ms); no snapshot stored; serving defaults'))).toBe(true);
+    });
+
+    it('stays quiet on a healthy start', async () => {
+      const { text } = await start(async () => ({ ok: true, json: async () => makeFlagResponse() }));
+      expect(text.filter((t) => t.includes('snapshot'))).toEqual([]);
+    });
+  });
+
   it('get() without sdkKey throws', () => {
     const platform = createMockPlatform();
     expect(() =>

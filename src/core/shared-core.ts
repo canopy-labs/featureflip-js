@@ -28,6 +28,27 @@ import {
   unevaluableFlagReason,
 } from './unevaluable.js';
 import { buildIdentity } from './identity.js';
+import {
+  SNAPSHOT_REFRESH_INTERVAL_MS,
+  SafeSnapshotStore,
+  computeKeyHash,
+  decodeEnvelope,
+  encodeEnvelopeText,
+} from './snapshot-store.js';
+import type { SnapshotReason, SnapshotStore } from './snapshot-store.js';
+
+/** A non-OK response to the full flag fetch; carries the status for diagnostics. */
+class FlagFetchError extends Error {
+  constructor(readonly status: number) {
+    super(`Failed to fetch flags: ${status}`);
+  }
+}
+
+export interface StartupInfo {
+  source: 'live' | 'snapshot' | 'none';
+  reason?: SnapshotReason;
+  snapshotAgeSeconds?: number;
+}
 
 /**
  * Resolve the built-in user id for an analytics event from either the
@@ -122,6 +143,18 @@ export class SharedFeatureflipCore {
    */
   private pollingIsStreamFallback = false;
 
+  private readonly snapshotStore: SafeSnapshotStore | null = null;
+  /** Identifies this (baseUrl, sdkKey) in the stored envelope; '' without a store. */
+  private readonly keyHash: string = '';
+  private startup: StartupInfo = { source: 'none' };
+  private lastEnvironment = '';
+  private persistInFlight = false;
+  private persistQueued = false;
+  /** Date.now() when the last write was started; 0 before the first. */
+  private lastPersistAt = 0;
+  /** The serialized `data` of the last write started, to skip unchanged rewrites. */
+  private lastPersistedData: string | null = null;
+
   /** Number of outstanding handles (including the one returned by the factory). */
   private refCount = 1;
 
@@ -133,6 +166,19 @@ export class SharedFeatureflipCore {
     this.config = resolveConfig(config);
     this.store = new FlagStore();
     this.platform = platform;
+    if (config.snapshotStore) {
+      if (!platform.sha256Hex) {
+        throw new Error(
+          'snapshotStore requires a platform with SHA-256 support (Node); it is not available on this platform',
+        );
+      }
+      this.snapshotStore = new SafeSnapshotStore(config.snapshotStore);
+      this.keyHash = computeKeyHash(
+        platform.sha256Hex.bind(platform),
+        this.config.baseUrl,
+        this.config.sdkKey,
+      );
+    }
     // Arrows, not bound methods: the evaluator calls `md5` detached.
     this.resolveDeps = {
       md5: (input) => this.platform.md5(input),
@@ -212,6 +258,16 @@ export class SharedFeatureflipCore {
 
   get isInitialized(): boolean {
     return this.initialized;
+  }
+
+  /** Where the current flag data came from. */
+  get startupInfo(): StartupInfo {
+    return { ...this.startup };
+  }
+
+  /** The store this core was built with, so the factory can warn when a later call's is ignored. */
+  get configuredSnapshotStore(): SnapshotStore | undefined {
+    return this.snapshotStore?.inner;
   }
 
   /**
@@ -388,6 +444,8 @@ export class SharedFeatureflipCore {
       this.pollTimer = null;
     }
     this.pollingIsStreamFallback = false;
+    // An in-flight snapshot write is neither awaited nor cancelled: it finishes
+    // (or fails) on its own, and `closed` stops any trailing write from starting.
     await this.events.close();
   }
 
@@ -413,6 +471,7 @@ export class SharedFeatureflipCore {
       // the data source started below keeps trying and self-heals when the
       // eval-api returns. A malformed payload will NOT self-heal, so say so.
       this.warnIfMalformed(err, 'initial snapshot');
+      await this.loadSnapshotFallback(this.describeInitFailure(err, controller.signal.aborted));
     } finally {
       clearTimeout(timer);
     }
@@ -423,6 +482,173 @@ export class SharedFeatureflipCore {
     await this.startDataSource();
   }
 
+  /**
+   * A short, key-free description of why the initial fetch failed, so a revoked
+   * key (HTTP 401/403) reads differently from an unreachable host in the log.
+   */
+  private describeInitFailure(err: unknown, aborted: boolean): string {
+    if (aborted) return `timed out after ${this.config.initTimeout}ms`;
+    if (err instanceof FlagFetchError) return `HTTP ${err.status}`;
+    if (err instanceof MalformedPayloadError) return `malformed payload: ${err.message}`;
+    if (err instanceof Error) return err.message || err.name;
+    return String(err);
+  }
+
+  /**
+   * Serve the persisted snapshot after a failed initial fetch. Never throws.
+   * The snapshot is applied without persisting, so loading it does not refresh
+   * its own fetchedAt. The store hands back opaque text; every check (envelope,
+   * environment, age, payload) and every reason is decided here.
+   */
+  private async loadSnapshotFallback(cause: string): Promise<void> {
+    const store = this.snapshotStore;
+    if (!store) return;
+    try {
+      // Bounded: a hung store must not block init during the outage this exists for.
+      // A get that resolves after the timeout is dropped (the race has moved on).
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = Symbol('timeout');
+      const result = await Promise.race([
+        store.get(),
+        new Promise<typeof timedOut>((resolve) => {
+          timer = setTimeout(() => resolve(timedOut), this.config.initTimeout);
+        }),
+      ]).finally(() => {
+        // Guarded: edge-sdk typechecks this file against a lib whose clearTimeout
+        // rejects undefined.
+        if (timer !== undefined) clearTimeout(timer);
+      });
+      if (result === timedOut) {
+        console.warn(
+          `[featureflip] initial flag fetch failed (${cause}) and the snapshot store read ` +
+            `timed out after ${this.config.initTimeout}ms; serving defaults`,
+        );
+        return;
+      }
+      if (this.closed) return;
+      // Nothing stored is a plain miss (no reason), but the failed fetch still needs
+      // its cause logged. Never the key.
+      if (result === undefined) {
+        console.warn(
+          `[featureflip] initial flag fetch failed (${cause}); no snapshot stored; serving defaults`,
+        );
+        return;
+      }
+      const now = Date.now();
+      const decoded = decodeEnvelope(result, this.keyHash, now);
+      if (!decoded.ok) {
+        this.rejectSnapshot(cause, 'snapshot-invalid', decoded.why);
+        return;
+      }
+      const { data, fetchedAt } = decoded.snapshot;
+      // A fetchedAt slightly in the future (clock skew within the tolerance) is age 0.
+      const ageMs = Math.max(0, now - fetchedAt);
+      const ageSeconds = Math.floor(ageMs / 1000);
+      if (ageMs > this.config.maxSnapshotAgeSeconds * 1000) {
+        this.rejectSnapshot(
+          cause,
+          'snapshot-expired',
+          `${ageSeconds}s old, limit ${this.config.maxSnapshotAgeSeconds}s`,
+          ageSeconds,
+        );
+        return;
+      }
+      this.applySnapshot(data, false);
+      this.startup = { source: 'snapshot', reason: 'snapshot', snapshotAgeSeconds: ageSeconds };
+      console.warn(
+        `[featureflip] initial flag fetch failed (${cause}); serving persisted snapshot (${ageSeconds}s old)`,
+      );
+    } catch (err) {
+      console.warn('[featureflip] could not load persisted snapshot:', err);
+    }
+  }
+
+  private rejectSnapshot(
+    cause: string,
+    reason: SnapshotReason,
+    why: string,
+    ageSeconds?: number,
+  ): void {
+    this.startup =
+      ageSeconds === undefined
+        ? { source: 'none', reason }
+        : { source: 'none', reason, snapshotAgeSeconds: ageSeconds };
+    console.warn(
+      `[featureflip] initial flag fetch failed (${cause}); ignoring persisted snapshot ` +
+        `(${reason}: ${why}); serving defaults`,
+    );
+  }
+
+  /**
+   * Persist after a single-flag delta, but only once a full snapshot has been
+   * applied live: otherwise the state may be stale snapshot data (or empty) and
+   * would be re-stamped with a fresh fetchedAt. Deltas are never throttled.
+   */
+  private persistDelta(): void {
+    if (this.startup.source === 'live') this.persist();
+  }
+
+  /**
+   * Persist after a full live apply (initial fetch, poll, SSE `sync`, segment
+   * refetch). Changed content is written at once; an unchanged state is only
+   * rewritten once the last write is SNAPSHOT_REFRESH_INTERVAL_MS old, so a
+   * polling client refreshes its fetchedAt without a write on every tick.
+   */
+  private persistFull(): void {
+    if (!this.snapshotStore || this.closed) return;
+    if (Date.now() - this.lastPersistAt < SNAPSHOT_REFRESH_INTERVAL_MS) {
+      const dataText = JSON.stringify(this.store.toResponse(this.lastEnvironment));
+      if (dataText === this.lastPersistedData) return;
+    }
+    this.persist();
+  }
+
+  /**
+   * Refresh the stored fetchedAt on a stream heartbeat while live, at most once
+   * per SNAPSHOT_REFRESH_INTERVAL_MS. Without it a healthy streaming client that
+   * sees no changes would leave its snapshot to age past maxSnapshotAgeSeconds.
+   * Never after a snapshot or `none` start: that state is not live data yet.
+   */
+  private refreshSnapshot(): void {
+    if (this.startup.source !== 'live') return;
+    if (Date.now() - this.lastPersistAt < SNAPSHOT_REFRESH_INTERVAL_MS) return;
+    this.persist();
+  }
+
+  /**
+   * Write the full current state to the store without blocking anything: at
+   * most one put in flight plus one trailing write, which reads state when it
+   * runs. fetchedAt is the write time in integer epoch ms.
+   */
+  private persist(): void {
+    if (!this.snapshotStore || this.closed) return;
+    if (this.persistInFlight) {
+      this.persistQueued = true;
+      return;
+    }
+    this.persistInFlight = true;
+    let write: Promise<void>;
+    try {
+      const fetchedAt = Date.now();
+      const dataText = JSON.stringify(this.store.toResponse(this.lastEnvironment));
+      this.lastPersistAt = fetchedAt;
+      this.lastPersistedData = dataText;
+      write = this.snapshotStore.put(encodeEnvelopeText(this.keyHash, fetchedAt, dataText));
+    } catch (err) {
+      console.warn('[featureflip] snapshot persist failed:', err);
+      write = Promise.resolve();
+    }
+    void write
+      .catch(() => {})
+      .then(() => {
+        this.persistInFlight = false;
+        if (this.persistQueued) {
+          this.persistQueued = false;
+          this.persist();
+        }
+      });
+  }
+
   private async fetchFlags(signal?: AbortSignal): Promise<void> {
     const response = await this.platform.fetch(
       `${this.config.baseUrl}/v1/sdk/flags`,
@@ -430,7 +656,7 @@ export class SharedFeatureflipCore {
     );
 
     if (!response.ok) {
-      throw new Error(`Failed to fetch flags: ${response.status}`);
+      throw new FlagFetchError(response.status);
     }
 
     const data = (await response.json()) as GetFlagsResponse;
@@ -449,7 +675,7 @@ export class SharedFeatureflipCore {
    * #2279 taught, and a guard applied to only one of them is the same bug with a
    * narrower trigger.
    */
-  private applySnapshot(data: GetFlagsResponse): void {
+  private applySnapshot(data: GetFlagsResponse, live = true): void {
     const { flags, segments, dropped } = dropUnevaluableEntities(data);
     for (const entity of dropped) {
       console.warn(
@@ -459,6 +685,11 @@ export class SharedFeatureflipCore {
       );
     }
     this.store.init(flags, segments, data.version);
+    this.lastEnvironment = data.environment;
+    if (live) {
+      this.startup = { source: 'live' };
+      this.persistFull();
+    }
   }
 
   private async startDataSource(): Promise<void> {
@@ -537,12 +768,19 @@ export class SharedFeatureflipCore {
           const update = JSON.parse(event.data) as StreamFlagUpdatedEvent;
           if (update.key) {
             this.store.delete(update.key);
+            this.persistDelta();
           }
         } catch {
           // Ignore parse errors
         }
       },
     );
+
+    // ping — the server's keep-alive (every 30s). A heartbeat on the current
+    // stream is the "live and healthy" signal for refreshing the snapshot's age.
+    es.addEventListener('ping', () => {
+      if (this.eventSource === es) this.refreshSnapshot();
+    });
 
     // segment.updated — refetch all flags
     es.addEventListener(
@@ -698,6 +936,7 @@ export class SharedFeatureflipCore {
           return;
         }
         this.store.upsert(flag);
+        this.persistDelta();
       }
     } catch (err) {
       this.warnIfMalformed(err, `flag delta for "${key}"`);
@@ -765,6 +1004,7 @@ export function resolvedConfigsEqual(a: ResolvedConfig, b: ResolvedConfig): bool
     a.flushInterval === b.flushInterval &&
     a.flushBatchSize === b.flushBatchSize &&
     a.initTimeout === b.initTimeout &&
-    a.maxStreamRetries === b.maxStreamRetries
+    a.maxStreamRetries === b.maxStreamRetries &&
+    a.maxSnapshotAgeSeconds === b.maxSnapshotAgeSeconds
   );
 }

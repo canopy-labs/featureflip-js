@@ -1,4 +1,5 @@
 import type { EvaluationInspector } from './core/types.js';
+import type { SnapshotStore } from './core/snapshot-store.js';
 
 export interface FeatureflipConfig {
   sdkKey: string;
@@ -24,6 +25,20 @@ export interface FeatureflipConfig {
    * than changing behavior.
    */
   wrappers?: string[];
+  /**
+   * Where the last good flag-config snapshot is persisted so the SDK can serve
+   * flags when the server is unreachable at startup. Opt-in: nothing is stored
+   * unless a store is supplied. Snapshot contents include targeting rules and
+   * customer attribute values, so choose storage with that in mind.
+   */
+  snapshotStore?: SnapshotStore;
+  /**
+   * Maximum age, in seconds, of a persisted snapshot that may still be served.
+   * Older snapshots are ignored. Defaults to 86400 (one day). Must be positive.
+   * Snapshot contents include targeting rules and customer attribute values;
+   * this option only has effect when `snapshotStore` is set.
+   */
+  maxSnapshotAgeSeconds?: number;
 }
 
 export interface ResolvedConfig {
@@ -35,6 +50,7 @@ export interface ResolvedConfig {
   flushBatchSize: number;
   initTimeout: number;
   maxStreamRetries: number;
+  maxSnapshotAgeSeconds: number;
 }
 
 const DEFAULTS = {
@@ -44,6 +60,7 @@ const DEFAULTS = {
   flushBatchSize: 100,
   initTimeout: 10_000,
   maxStreamRetries: 5,
+  maxSnapshotAgeSeconds: 86_400,
 } as const;
 
 export function resolveConfig(config: FeatureflipConfig): ResolvedConfig {
@@ -65,6 +82,8 @@ export function resolveConfig(config: FeatureflipConfig): ResolvedConfig {
     flushBatchSize: config.flushBatchSize ?? DEFAULTS.flushBatchSize,
     initTimeout: config.initTimeout ?? DEFAULTS.initTimeout,
     maxStreamRetries: config.maxStreamRetries ?? DEFAULTS.maxStreamRetries,
+    maxSnapshotAgeSeconds:
+      config.maxSnapshotAgeSeconds ?? DEFAULTS.maxSnapshotAgeSeconds,
   };
 
   // Validate numeric config. Invalid values wedge the runtime rather than
@@ -75,6 +94,7 @@ export function resolveConfig(config: FeatureflipConfig): ResolvedConfig {
   requirePositive('flushInterval', resolved.flushInterval);
   requirePositive('pollInterval', resolved.pollInterval);
   requirePositive('initTimeout', resolved.initTimeout);
+  requirePositive('maxSnapshotAgeSeconds', resolved.maxSnapshotAgeSeconds);
   if (!Number.isFinite(resolved.flushBatchSize) || resolved.flushBatchSize < 1) {
     throw new Error('flushBatchSize must be a number >= 1');
   }

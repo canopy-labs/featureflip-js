@@ -11,4 +11,7 @@ export type {
   FlagType,
   FlagUpdateListener,
 } from './core/types.js';
+export { FileSnapshotStore } from './platform/file-snapshot-store.js';
+export type { StartupInfo } from './core/shared-core.js';
+export type { SnapshotStore } from './core/snapshot-store.js';
 export type { Platform } from './platform/types.js';

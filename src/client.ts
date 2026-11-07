@@ -1,6 +1,7 @@
 import type { FeatureflipConfig } from './config.js';
 import { resolveConfig } from './config.js';
 import { SharedFeatureflipCore, resolvedConfigsEqual } from './core/shared-core.js';
+import type { StartupInfo } from './core/shared-core.js';
 import type {
   EvaluationContext,
   EvaluationDetail,
@@ -71,7 +72,34 @@ export class FeatureflipClient {
       if (existing) {
         if (existing.tryAcquire()) {
           const resolved = resolveConfig(config);
-          if (!resolvedConfigsEqual(existing.config, resolved)) {
+          // Snapshot options get their own warning naming them: the store is a
+          // live object the core already holds, so it is compared by identity.
+          const ignored: string[] = [];
+          if (
+            config.snapshotStore !== undefined &&
+            config.snapshotStore !== existing.configuredSnapshotStore
+          ) {
+            ignored.push('snapshotStore');
+          }
+          // Only an explicitly passed age can be "ignored": an omitted one is not a request.
+          if (
+            config.maxSnapshotAgeSeconds !== undefined &&
+            resolved.maxSnapshotAgeSeconds !== existing.config.maxSnapshotAgeSeconds
+          ) {
+            ignored.push('maxSnapshotAgeSeconds');
+          }
+          if (ignored.length > 0) {
+            console.warn(
+              `[featureflip] FeatureflipClient.get was passed ${ignored.join(' and ')}, which ` +
+                'is ignored because the client for this SDK key already exists. Pass it on the ' +
+                'first get() for the key.',
+            );
+          }
+          const otherOptions = {
+            ...resolved,
+            maxSnapshotAgeSeconds: existing.config.maxSnapshotAgeSeconds,
+          };
+          if (!resolvedConfigsEqual(existing.config, otherOptions)) {
             console.warn(
               '[featureflip] FeatureflipClient.get called with different options for ' +
                 'an SDK key already in use. The cached instance\'s options are preserved; ' +
@@ -97,6 +125,14 @@ export class FeatureflipClient {
   /** Whether the client has successfully loaded initial flag data. */
   get isInitialized(): boolean {
     return !this.disposed && this.core.isInitialized;
+  }
+
+  /**
+   * Where the initial flag data came from: the live server, a persisted
+   * snapshot (see `snapshotStore`), or nowhere (defaults are served).
+   */
+  get startupInfo(): StartupInfo {
+    return this.core.startupInfo;
   }
 
   /**

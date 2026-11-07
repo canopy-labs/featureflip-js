@@ -1,4 +1,4 @@
-import type { FlagDto, SegmentDto } from './types.js';
+import type { FlagDto, GetFlagsResponse, SegmentDto } from './types.js';
 
 /**
  * Called with the keys of every flag affected by a single store mutation.
@@ -34,6 +34,16 @@ export class FlagStore {
 
   getVersion(): number {
     return this.version;
+  }
+
+  /** The full current state in wire (`GetFlagsResponse`) shape, for persistence. */
+  toResponse(environment: string): GetFlagsResponse {
+    return {
+      environment,
+      version: this.version,
+      flags: Array.from(this.flags.values()),
+      segments: Array.from(this.segments.values()),
+    };
   }
 
   /**
