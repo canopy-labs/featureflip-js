@@ -59,13 +59,16 @@ function isRetryableSendFailure(err: unknown): boolean {
  * When it does, strip just the metadata and keep the event — its key is the
  * analytics signal worth preserving — and warn so the failure isn't silent.
  */
-function sanitizeEvent(event: SdkEventDto): SdkEventDto {
+function sanitizeEvent(
+  event: SdkEventDto,
+  warn: (...args: unknown[]) => void,
+): SdkEventDto {
   if (event.metadata === undefined) return event;
   try {
     JSON.stringify(event.metadata);
     return event;
   } catch (err) {
-    console.warn(
+    warn(
       `[featureflip] dropping non-serializable metadata on event "${event.flagKey}":`,
       err,
     );
@@ -110,6 +113,7 @@ export class EventProcessor {
     flushBatchSize: number,
     maxQueueSize: number = DEFAULT_MAX_QUEUE_SIZE,
     private readonly options: { flushOnFullBatch?: boolean; maxBatchesPerFlush?: number } = {},
+    private readonly warn: (...args: unknown[]) => void = (...a) => console.warn(...a),
   ) {
     this.maxQueueSize = maxQueueSize >= 1 ? maxQueueSize : DEFAULT_MAX_QUEUE_SIZE;
     // Defence-in-depth against a non-positive batch size: splice(0, n) with
@@ -133,7 +137,7 @@ export class EventProcessor {
 
   enqueue(event: SdkEventDto): void {
     if (this.closed) return;
-    this.queue.push(sanitizeEvent(event));
+    this.queue.push(sanitizeEvent(event, this.warn));
     this.trimToBound();
     if (
       this.options.flushOnFullBatch !== false &&
@@ -172,7 +176,7 @@ export class EventProcessor {
             this.nextAutoFlushAt = Date.now() + this.flushInterval;
             return;
           }
-          console.warn(
+          this.warn(
             `[featureflip] dropping ${batch.length} analytics event(s) the events endpoint rejected permanently:`,
             err,
           );
@@ -198,7 +202,7 @@ export class EventProcessor {
     const overflow = this.queue.length - this.maxQueueSize;
     if (overflow <= 0) return;
     this.queue.splice(0, overflow);
-    console.warn(
+    this.warn(
       `[featureflip] event queue is full; dropped ${overflow} of the oldest analytics event(s)`,
     );
   }

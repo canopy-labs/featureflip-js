@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.19.2 — 2026-11-16
+
+### Security
+
+- The SDK key is now redacted from every log line the SDK emits, including error messages and causes from the fetch and EventSource stack, which can quote the `Authorization` header or stream URL. Applied once when the shared core is built. (#5167, #5166)
+
 ## 2.19.1 — 2026-11-09
 
 ### Changed

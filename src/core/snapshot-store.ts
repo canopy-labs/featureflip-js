@@ -113,14 +113,17 @@ export function decodeEnvelope(
  * is logged and treated as a miss (get) or a dropped write (put).
  */
 export class SafeSnapshotStore {
-  constructor(readonly inner: SnapshotStore) {}
+  constructor(
+    readonly inner: SnapshotStore,
+    private readonly warn: (...args: unknown[]) => void = (...a) => console.warn(...a),
+  ) {}
 
   /** The raw stored value (null normalized to undefined). Never rejects. */
   async get(): Promise<unknown> {
     try {
       return (await this.inner.get()) ?? undefined;
     } catch (err) {
-      console.warn('[featureflip] snapshot store read failed:', err);
+      this.warn('[featureflip] snapshot store read failed:', err);
       return undefined;
     }
   }
@@ -129,7 +132,7 @@ export class SafeSnapshotStore {
     try {
       await this.inner.put(text);
     } catch (err) {
-      console.warn('[featureflip] snapshot store write failed:', err);
+      this.warn('[featureflip] snapshot store write failed:', err);
     }
   }
 }

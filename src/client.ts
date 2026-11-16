@@ -1,5 +1,6 @@
 import type { FeatureflipConfig } from './config.js';
 import { resolveConfig } from './config.js';
+import { createRedactingWarn } from './core/redacting-log.js';
 import { SharedFeatureflipCore, resolvedConfigsEqual } from './core/shared-core.js';
 import type { StartupInfo } from './core/shared-core.js';
 import type {
@@ -60,6 +61,7 @@ export class FeatureflipClient {
       throw new Error('sdkKey is required');
     }
     const sdkKey = config.sdkKey;
+    const warn = createRedactingWarn(sdkKey);
 
     // Retry loop handles the race where a cached core is found but has already
     // begun shutting down (refcount hit 0 between lookup and tryAcquire).
@@ -89,7 +91,7 @@ export class FeatureflipClient {
             ignored.push('maxSnapshotAgeSeconds');
           }
           if (ignored.length > 0) {
-            console.warn(
+            warn(
               `[featureflip] FeatureflipClient.get was passed ${ignored.join(' and ')}, which ` +
                 'is ignored because the client for this SDK key already exists. Pass it on the ' +
                 'first get() for the key.',
@@ -100,7 +102,7 @@ export class FeatureflipClient {
             maxSnapshotAgeSeconds: existing.config.maxSnapshotAgeSeconds,
           };
           if (!resolvedConfigsEqual(existing.config, otherOptions)) {
-            console.warn(
+            warn(
               '[featureflip] FeatureflipClient.get called with different options for ' +
                 'an SDK key already in use. The cached instance\'s options are preserved; ' +
                 'the passed options are ignored.',

@@ -28,6 +28,7 @@ import {
   unevaluableFlagReason,
 } from './unevaluable.js';
 import { buildIdentity } from './identity.js';
+import { createRedactingWarn, type Warn } from './redacting-log.js';
 import {
   SNAPSHOT_REFRESH_INTERVAL_MS,
   SafeSnapshotStore,
@@ -162,8 +163,12 @@ export class SharedFeatureflipCore {
   private owningMap: Map<string, SharedFeatureflipCore> | null = null;
   private owningKey: string | null = null;
 
+  /** Every SDK-originated log line goes through this; it strips the SDK key (#5167). */
+  private readonly warn: Warn;
+
   constructor(config: FeatureflipConfig, platform: Platform) {
     this.config = resolveConfig(config);
+    this.warn = createRedactingWarn(this.config.sdkKey);
     this.store = new FlagStore();
     this.platform = platform;
     if (config.snapshotStore) {
@@ -172,7 +177,7 @@ export class SharedFeatureflipCore {
           'snapshotStore requires a platform with SHA-256 support (Node); it is not available on this platform',
         );
       }
-      this.snapshotStore = new SafeSnapshotStore(config.snapshotStore);
+      this.snapshotStore = new SafeSnapshotStore(config.snapshotStore, this.warn);
       this.keyHash = computeKeyHash(
         platform.sha256Hex.bind(platform),
         this.config.baseUrl,
@@ -183,11 +188,11 @@ export class SharedFeatureflipCore {
     this.resolveDeps = {
       md5: (input) => this.platform.md5(input),
       getSegment: (segKey) => this.store.getSegment(segKey),
-      onUnbucketable: (i) => warnUnbucketable(i),
+      onUnbucketable: (i) => warnUnbucketable(i, (m) => this.warn(m)),
     };
     // Also from the RAW config, for the same reason as inspectors below: wrappers
     // identify the caller and must not trip the config-equality warning.
-    this.identity = buildIdentity(config.wrappers);
+    this.identity = buildIdentity(config.wrappers, this.warn);
     // Read from the RAW config — inspectors are deliberately not part of
     // ResolvedConfig (functions aren't structurally comparable, and a differing
     // callback must not trigger the config-equality warning). Filter to
@@ -215,6 +220,9 @@ export class SharedFeatureflipCore {
       },
       this.config.flushInterval,
       this.config.flushBatchSize,
+      undefined,
+      undefined,
+      this.warn,
     );
 
     // The store's own notifier swallows listener errors, which would silently
@@ -326,7 +334,7 @@ export class SharedFeatureflipCore {
       try {
         listener([...keys]);
       } catch (err) {
-        console.warn('[featureflip] flag update listener threw:', err);
+        this.warn('[featureflip] flag update listener threw:', err);
       }
     }
   }
@@ -519,7 +527,7 @@ export class SharedFeatureflipCore {
         if (timer !== undefined) clearTimeout(timer);
       });
       if (result === timedOut) {
-        console.warn(
+        this.warn(
           `[featureflip] initial flag fetch failed (${cause}) and the snapshot store read ` +
             `timed out after ${this.config.initTimeout}ms; serving defaults`,
         );
@@ -529,7 +537,7 @@ export class SharedFeatureflipCore {
       // Nothing stored is a plain miss (no reason), but the failed fetch still needs
       // its cause logged. Never the key.
       if (result === undefined) {
-        console.warn(
+        this.warn(
           `[featureflip] initial flag fetch failed (${cause}); no snapshot stored; serving defaults`,
         );
         return;
@@ -555,11 +563,11 @@ export class SharedFeatureflipCore {
       }
       this.applySnapshot(data, false);
       this.startup = { source: 'snapshot', reason: 'snapshot', snapshotAgeSeconds: ageSeconds };
-      console.warn(
+      this.warn(
         `[featureflip] initial flag fetch failed (${cause}); serving persisted snapshot (${ageSeconds}s old)`,
       );
     } catch (err) {
-      console.warn('[featureflip] could not load persisted snapshot:', err);
+      this.warn('[featureflip] could not load persisted snapshot:', err);
     }
   }
 
@@ -573,7 +581,7 @@ export class SharedFeatureflipCore {
       ageSeconds === undefined
         ? { source: 'none', reason }
         : { source: 'none', reason, snapshotAgeSeconds: ageSeconds };
-    console.warn(
+    this.warn(
       `[featureflip] initial flag fetch failed (${cause}); ignoring persisted snapshot ` +
         `(${reason}: ${why}); serving defaults`,
     );
@@ -635,7 +643,7 @@ export class SharedFeatureflipCore {
       this.lastPersistedData = dataText;
       write = this.snapshotStore.put(encodeEnvelopeText(this.keyHash, fetchedAt, dataText));
     } catch (err) {
-      console.warn('[featureflip] snapshot persist failed:', err);
+      this.warn('[featureflip] snapshot persist failed:', err);
       write = Promise.resolve();
     }
     void write
@@ -678,7 +686,7 @@ export class SharedFeatureflipCore {
   private applySnapshot(data: GetFlagsResponse, live = true): void {
     const { flags, segments, dropped } = dropUnevaluableEntities(data);
     for (const entity of dropped) {
-      console.warn(
+      this.warn(
         `[featureflip] dropping ${entity.kind} "${entity.key}": ${entity.reason}. ` +
           'This SDK version may be older than the flag configuration; the rest of the ' +
           'configuration was applied.',
@@ -728,7 +736,7 @@ export class SharedFeatureflipCore {
     try {
       es = await this.platform.createEventSource(streamUrl, this.headers());
     } catch (err) {
-      console.warn(
+      this.warn(
         '[featureflip] could not start the SSE stream, falling back to polling:',
         err,
       );
@@ -836,7 +844,7 @@ export class SharedFeatureflipCore {
         this.streamRetryCount >= this.config.maxStreamRetries &&
         !this.pollingIsStreamFallback
       ) {
-        console.warn(
+        this.warn(
           `[featureflip] SSE connection failed after ${this.config.maxStreamRetries} retries, ` +
             'falling back to polling while the stream keeps retrying',
         );
@@ -909,7 +917,7 @@ export class SharedFeatureflipCore {
    */
   private warnIfMalformed(err: unknown, context: string): void {
     if (err instanceof MalformedPayloadError) {
-      console.warn(`[featureflip] discarding malformed ${context}:`, err.message);
+      this.warn(`[featureflip] discarding malformed ${context}:`, err.message);
     }
   }
 
@@ -929,7 +937,7 @@ export class SharedFeatureflipCore {
         // if there was no previous copy.
         const unevaluable = unevaluableFlagReason(flag);
         if (unevaluable) {
-          console.warn(
+          this.warn(
             `[featureflip] dropping flag delta for "${key}": ${unevaluable}. ` +
               'This SDK version may be older than the flag configuration.',
           );
@@ -976,7 +984,7 @@ export class SharedFeatureflipCore {
       try {
         inspector(event);
       } catch (err) {
-        console.warn('[featureflip] evaluation inspector threw:', err);
+        this.warn('[featureflip] evaluation inspector threw:', err);
       }
     }
   }
